@@ -1,0 +1,703 @@
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { DialogFooter } from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
+import { Contract, Payment, Property, Owner, Tenant } from "@shared/schema";
+import { paymentFormSchema } from "@/utils/validation";
+import { z } from "zod";
+import { apiRequest } from "@/lib/queryClient";
+import { useToast } from "@/hooks/use-toast";
+import { 
+  Select, 
+  SelectContent, 
+  SelectItem, 
+  SelectTrigger, 
+  SelectValue 
+} from "@/components/ui/select";
+import { formatCurrency, formatDate, formatDateToISO } from "@/utils/formatters";
+import { CalendarIcon, Printer } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Calendar } from "@/components/ui/calendar";
+import { cn } from "@/lib/utils";
+import { useState, useEffect } from "react";
+import { PaymentReceiptDialog } from "./payment-receipt-dialog";
+
+type PaymentFormValues = z.infer<typeof paymentFormSchema>;
+
+interface PaymentFormProps {
+  contracts: Contract[];
+  initialData?: Payment | null;
+  isEditing?: boolean;
+  onSuccess: () => void;
+}
+
+export const PaymentForm = ({ 
+  contracts, 
+  initialData, 
+  isEditing = false, 
+  onSuccess 
+}: PaymentFormProps) => {
+  const { toast } = useToast();
+  const [selectedContract, setSelectedContract] = useState<Contract | null>(null);
+  const [showReceiptDialog, setShowReceiptDialog] = useState(false);
+  const [paymentData, setPaymentData] = useState<Payment | null>(null);
+  const [contractData, setContractData] = useState<Contract | null>(null);
+  const [ownerData, setOwnerData] = useState<Owner | null>(null);
+  const [tenantData, setTenantData] = useState<Tenant | null>(null);
+  const [propertyData, setPropertyData] = useState<Property | null>(null);
+
+  // Convert initialData for form
+  const getDefaultValues = () => {
+    if (!initialData) {
+      return {
+        contractId: 0,
+        dueDate: formatDateToISO(new Date()),
+        value: 0,
+        isPaid: false,
+        paymentDate: undefined,
+        interestAmount: 0,
+        latePaymentFee: 0,
+        paymentMethod: "",
+        receiptNumber: "",
+        observations: "",
+      };
+    }
+
+    return {
+      ...initialData,
+      dueDate: formatDateToISO(new Date(initialData.dueDate)),
+      paymentDate: initialData.paymentDate ? formatDateToISO(new Date(initialData.paymentDate)) : undefined,
+      interestAmount: initialData.interestAmount || 0,
+      latePaymentFee: initialData.latePaymentFee || 0,
+      paymentMethod: initialData.paymentMethod || "",
+      receiptNumber: initialData.receiptNumber || "",
+    };
+  };
+
+  // Form setup
+  const form = useForm<PaymentFormValues>({
+    resolver: zodResolver(paymentFormSchema),
+    defaultValues: getDefaultValues(),
+  });
+
+  // Watch form values for dynamic updates
+  const watchContractId = form.watch("contractId");
+  const watchIsPaid = form.watch("isPaid");
+  const watchPaymentDate = form.watch("paymentDate");
+  
+  // Gera um número de recibo automaticamente quando o pagamento é marcado como pago
+  useEffect(() => {
+    if (watchIsPaid) {
+      const today = new Date();
+      // Formato: REC-CONTRATO-ANO-MES-DIA-HORA-MINUTO
+      const reciboPadrao = `REC-${watchContractId || '0'}-${today.getFullYear()}${(today.getMonth() + 1).toString().padStart(2, '0')}${today.getDate().toString().padStart(2, '0')}-${today.getHours().toString().padStart(2, '0')}${today.getMinutes().toString().padStart(2, '0')}`;
+      
+      // Só atualiza se o campo estiver vazio ou com o valor padrão
+      if (!form.getValues("receiptNumber")) {
+        form.setValue("receiptNumber", reciboPadrao);
+      }
+    }
+  }, [watchIsPaid, watchContractId, form]);
+
+  // Update selected contract when contractId changes
+  useEffect(() => {
+    if (watchContractId) {
+      const contract = contracts.find(c => c.id === watchContractId);
+      if (contract) {
+        setSelectedContract(contract);
+        form.setValue("value", contract.rentValue);
+      }
+    }
+  }, [watchContractId, contracts, form]);
+  
+  // Calcular automaticamente juros e multa para pagamentos atrasados
+  useEffect(() => {
+    if (watchIsPaid && watchPaymentDate && form.getValues("dueDate")) {
+      const dueDate = new Date(form.getValues("dueDate"));
+      const paymentDate = new Date(watchPaymentDate);
+      const baseValue = form.getValues("value") || 0;
+      
+      // Se a data de pagamento for posterior à data de vencimento
+      if (paymentDate > dueDate) {
+        // Calcular dias de atraso
+        const diffTime = Math.abs(paymentDate.getTime() - dueDate.getTime());
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        
+        // Multa padrão de 2%
+        const lateFee = baseValue * 0.02;
+        
+        // Juros de 1% ao mês, calculado diariamente (0.033% ao dia)
+        const interestRate = 0.01 / 30; // 1% ao mês dividido por 30 dias
+        const interest = baseValue * interestRate * diffDays;
+        
+        // Atualizar os campos
+        form.setValue("latePaymentFee", parseFloat(lateFee.toFixed(2)));
+        form.setValue("interestAmount", parseFloat(interest.toFixed(2)));
+      } else {
+        // Se não houver atraso, zerar os valores
+        form.setValue("latePaymentFee", 0);
+        form.setValue("interestAmount", 0);
+      }
+    }
+  }, [watchIsPaid, watchPaymentDate, form]);
+
+  // Consultas para buscar dados para o recibo
+  const { data: ownersData } = useQuery({
+    queryKey: ['/api/owners'],
+    enabled: showReceiptDialog,
+  });
+
+  const { data: tenantsData } = useQuery({
+    queryKey: ['/api/tenants'],
+    enabled: showReceiptDialog,
+  });
+
+  const { data: propertiesData } = useQuery({
+    queryKey: ['/api/properties'],
+    enabled: showReceiptDialog,
+  });
+
+  // Create payment mutation
+  const createPaymentMutation = useMutation({
+    mutationFn: async (data: PaymentFormValues) => {
+      const response = await apiRequest('POST', '/api/payments', data);
+      return response.json();
+    },
+    onSuccess: (createdPayment) => {
+      toast({
+        title: "Pagamento criado",
+        description: "O pagamento foi criado com sucesso",
+      });
+      
+      // Se o pagamento foi confirmado, mostrar o recibo
+      if (createdPayment.isPaid) {
+        setPaymentData(createdPayment);
+        const contract = contracts.find(c => c.id === createdPayment.contractId);
+        setContractData(contract || null);
+        
+        if (contract && ownersData && tenantsData && propertiesData) {
+          const owner = ownersData.find((o: any) => o.id === contract.ownerId);
+          const tenant = tenantsData.find((t: any) => t.id === contract.tenantId);
+          const property = propertiesData.find((p: any) => p.id === contract.propertyId);
+          
+          setOwnerData(owner || null);
+          setTenantData(tenant || null);
+          setPropertyData(property || null);
+          
+          setShowReceiptDialog(true);
+        }
+      }
+      
+      form.reset();
+      onSuccess();
+    },
+    onError: (error) => {
+      toast({
+        title: "Erro ao criar pagamento",
+        description: error.message || "Ocorreu um erro ao criar o pagamento",
+        variant: "destructive",
+      });
+    }
+  });
+
+  // Update payment mutation
+  const updatePaymentMutation = useMutation({
+    mutationFn: async (data: { id: number; data: PaymentFormValues }) => {
+      const response = await apiRequest('PATCH', `/api/payments/${data.id}`, data.data);
+      return response.json();
+    },
+    onSuccess: (updatedPayment) => {
+      toast({
+        title: "Pagamento atualizado",
+        description: "O pagamento foi atualizado com sucesso",
+      });
+      
+      // Se o pagamento foi confirmado e o status foi alterado para pago, mostrar o recibo
+      if (updatedPayment.isPaid && (!initialData?.isPaid || initialData?.isPaid === false)) {
+        setPaymentData(updatedPayment);
+        const contract = contracts.find(c => c.id === updatedPayment.contractId);
+        setContractData(contract || null);
+        
+        if (contract && ownersData && tenantsData && propertiesData) {
+          const owner = ownersData.find((o: any) => o.id === contract.ownerId);
+          const tenant = tenantsData.find((t: any) => t.id === contract.tenantId);
+          const property = propertiesData.find((p: any) => p.id === contract.propertyId);
+          
+          setOwnerData(owner || null);
+          setTenantData(tenant || null);
+          setPropertyData(property || null);
+          
+          setShowReceiptDialog(true);
+        }
+      }
+      
+      onSuccess();
+    },
+    onError: (error) => {
+      toast({
+        title: "Erro ao atualizar pagamento",
+        description: error.message || "Ocorreu um erro ao atualizar o pagamento",
+        variant: "destructive",
+      });
+    }
+  });
+
+  // Form submission handler
+  const onSubmit = (data: PaymentFormValues) => {
+    // Format numeric values
+    const formattedData = {
+      ...data,
+      value: Number(data.value),
+      // If not paid, remove payment date
+      paymentDate: data.isPaid ? data.paymentDate : undefined
+    };
+
+    if (isEditing && initialData) {
+      updatePaymentMutation.mutate({ id: initialData.id, data: formattedData });
+    } else {
+      createPaymentMutation.mutate(formattedData);
+    }
+  };
+
+  // Find tenant name by contract for display
+  const getTenantNameByContract = (contractId: number) => {
+    const contract = contracts.find(c => c.id === contractId);
+    if (!contract) return "";
+    
+    // Note: In a full implementation, we'd need to fetch tenants
+    // For now we just display the contract ID as a placeholder
+    return `Contrato #${contract.id}`;
+  };
+
+  // Função para cancelar e fechar o diálogo
+  const handleCloseReceiptDialog = () => {
+    setShowReceiptDialog(false);
+  };
+
+  return (
+    <>
+      {showReceiptDialog && (
+        <PaymentReceiptDialog 
+          payment={paymentData}
+          contract={contractData}
+          owner={ownerData}
+          tenant={tenantData}
+          property={propertyData}
+          open={showReceiptDialog}
+          onClose={handleCloseReceiptDialog}
+        />
+      )}
+
+      <Form {...form}>
+        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <FormField
+            control={form.control}
+            name="contractId"
+            render={({ field }) => (
+              <FormItem className="sm:col-span-2">
+                <FormLabel>Contrato</FormLabel>
+                <Select 
+                  onValueChange={(value) => field.onChange(Number(value))} 
+                  defaultValue={field.value ? String(field.value) : undefined}
+                >
+                  <FormControl>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Selecione um contrato" />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    {contracts.map((contract) => (
+                      <SelectItem key={contract.id} value={String(contract.id)}>
+                        Contrato #{contract.id} - {getTenantNameByContract(contract.id)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          
+          {selectedContract && (
+            <div className="sm:col-span-2 p-3 bg-neutral-50 rounded-md border border-neutral-200 mb-2">
+              <p className="text-sm font-medium text-neutral-700">Detalhes do contrato</p>
+              <p className="text-sm text-neutral-600">Valor do aluguel: {formatCurrency(selectedContract.rentValue)}</p>
+              <p className="text-sm text-neutral-600">Dia do pagamento: {selectedContract.paymentDay}</p>
+            </div>
+          )}
+          
+          <FormField
+            control={form.control}
+            name="dueDate"
+            render={({ field }) => (
+              <FormItem className="flex flex-col">
+                <FormLabel>Data de vencimento</FormLabel>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <FormControl>
+                      <Button
+                        variant={"outline"}
+                        className={cn(
+                          "pl-3 text-left font-normal",
+                          !field.value && "text-muted-foreground"
+                        )}
+                      >
+                        {field.value ? (
+                          formatDate(field.value)
+                        ) : (
+                          <span>Selecione uma data</span>
+                        )}
+                        <CalendarIcon className="ml-auto h-4 w-4 opacity-50" />
+                      </Button>
+                    </FormControl>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-auto p-0" align="start">
+                    <Calendar
+                      mode="single"
+                      selected={field.value ? new Date(field.value) : undefined}
+                      onSelect={(date) => field.onChange(date ? formatDateToISO(date) : "")}
+                      initialFocus
+                    />
+                  </PopoverContent>
+                </Popover>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          
+          <FormField
+            control={form.control}
+            name="value"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Valor</FormLabel>
+                <FormControl>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500">
+                      R$
+                    </span>
+                    <Input 
+                      {...field} 
+                      type="number" 
+                      min="0" 
+                      step="0.01"
+                      className="pl-10" 
+                      onChange={e => field.onChange(Number(e.target.value))}
+                      value={field.value}
+                    />
+                  </div>
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          
+          <FormField
+            control={form.control}
+            name="isPaid"
+            render={({ field }) => (
+              <FormItem className="flex flex-row items-center justify-between space-x-2 space-y-0 rounded-md border p-4 sm:col-span-2">
+                <div className="space-y-0.5">
+                  <FormLabel>Pagamento confirmado</FormLabel>
+                </div>
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          
+          {watchIsPaid ? (
+            <>
+              <FormField
+                control={form.control}
+                name="paymentDate"
+                render={({ field }) => (
+                  <FormItem className="flex flex-col">
+                    <FormLabel>Data do pagamento</FormLabel>
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <FormControl>
+                          <Button
+                            variant={"outline"}
+                            className={cn(
+                              "pl-3 text-left font-normal",
+                              !field.value && "text-muted-foreground"
+                            )}
+                          >
+                            {field.value ? (
+                              formatDate(field.value)
+                            ) : (
+                              <span>Selecione uma data</span>
+                            )}
+                            <CalendarIcon className="ml-auto h-4 w-4 opacity-50" />
+                          </Button>
+                        </FormControl>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0" align="start">
+                        <Calendar
+                          mode="single"
+                          selected={field.value ? new Date(field.value) : undefined}
+                          onSelect={(date) => field.onChange(date ? formatDateToISO(date) : "")}
+                          initialFocus
+                        />
+                      </PopoverContent>
+                    </Popover>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              
+              <FormField
+                control={form.control}
+                name="paymentMethod"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Método de Pagamento</FormLabel>
+                    <Select 
+                      onValueChange={field.onChange} 
+                      defaultValue={field.value}
+                      value={field.value}
+                    >
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Selecione o método de pagamento" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        <SelectItem value="Dinheiro">Dinheiro</SelectItem>
+                        <SelectItem value="PIX">PIX</SelectItem>
+                        <SelectItem value="Transferência Bancária">Transferência Bancária</SelectItem>
+                        <SelectItem value="Boleto">Boleto</SelectItem>
+                        <SelectItem value="Cartão de Crédito">Cartão de Crédito</SelectItem>
+                        <SelectItem value="Cartão de Débito">Cartão de Débito</SelectItem>
+                        <SelectItem value="Cheque">Cheque</SelectItem>
+                        <SelectItem value="Depósito">Depósito</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              
+              <FormField
+                control={form.control}
+                name="latePaymentFee"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Multa (R$)</FormLabel>
+                    <FormControl>
+                      <div className="relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500">
+                          R$
+                        </span>
+                        <Input 
+                          type="number" 
+                          min="0" 
+                          step="0.01"
+                          className="pl-10"
+                          value={field.value || 0}
+                          onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
+                        />
+                      </div>
+                    </FormControl>
+                    <FormDescription>
+                      Multa de 2% aplicada em caso de atraso
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="interestAmount"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Juros (R$)</FormLabel>
+                    <FormControl>
+                      <div className="relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500">
+                          R$
+                        </span>
+                        <Input 
+                          type="number" 
+                          min="0" 
+                          step="0.01"
+                          className="pl-10"
+                          value={field.value || 0}
+                          onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
+                        />
+                      </div>
+                    </FormControl>
+                    <FormDescription>
+                      Juros de 1% ao mês calculado por dia de atraso
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              
+              <FormField
+                control={form.control}
+                name="latePaymentFee"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Multa (2%)</FormLabel>
+                    <FormControl>
+                      <Input 
+                        type="number" 
+                        step="0.01"
+                        {...field} 
+                        value={field.value || 0}
+                        onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="interestAmount"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Juros (1% ao mês)</FormLabel>
+                    <FormControl>
+                      <Input 
+                        type="number" 
+                        step="0.01"
+                        {...field} 
+                        value={field.value || 0}
+                        onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="receiptNumber"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Número do Recibo</FormLabel>
+                    <FormControl>
+                      <Input 
+                        {...field} 
+                        placeholder="Gerado automaticamente"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              
+              <FormField
+                control={form.control}
+                name="interestAmount"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Juros (R$)</FormLabel>
+                    <FormControl>
+                      <div className="relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500">
+                          R$
+                        </span>
+                        <Input 
+                          {...field} 
+                          type="number" 
+                          min="0" 
+                          step="0.01"
+                          className="pl-10" 
+                          onChange={e => field.onChange(Number(e.target.value))}
+                          value={field.value}
+                        />
+                      </div>
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              
+              <FormField
+                control={form.control}
+                name="latePaymentFee"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Multa (R$)</FormLabel>
+                    <FormControl>
+                      <div className="relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500">
+                          R$
+                        </span>
+                        <Input 
+                          {...field} 
+                          type="number" 
+                          min="0" 
+                          step="0.01"
+                          className="pl-10" 
+                          onChange={e => field.onChange(Number(e.target.value))}
+                          value={field.value}
+                        />
+                      </div>
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </>
+          ) : null}
+          
+          <FormField
+            control={form.control}
+            name="observations"
+            render={({ field }) => (
+              <FormItem className="sm:col-span-2">
+                <FormLabel>Observações</FormLabel>
+                <FormControl>
+                  <Textarea 
+                    {...field} 
+                    placeholder="Observações adicionais sobre o pagamento..."
+                    rows={4}
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
+        
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={onSuccess}
+          >
+            Cancelar
+          </Button>
+          <Button 
+            type="submit"
+            disabled={createPaymentMutation.isPending || updatePaymentMutation.isPending}
+          >
+            {(createPaymentMutation.isPending || updatePaymentMutation.isPending) 
+              ? "Salvando..." 
+              : "Salvar"}
+          </Button>
+        </DialogFooter>
+      </form>
+    </Form>
+    </>
+  );
+};

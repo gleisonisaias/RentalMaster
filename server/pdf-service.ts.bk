@@ -1,0 +1,1776 @@
+// Serviço de geração de PDF do servidor
+import PDFDocument from 'pdfkit';
+import type * as PDFKit from 'pdfkit';
+import { Contract, Owner, Property, Tenant, ContractRenewal } from '@shared/schema';
+import { formatCPF, formatPhone } from '../client/src/utils/validation';
+import { Request, Response } from 'express';
+import { storage } from './storage';
+import { getProcessedTemplate, getProcessedTemplateByType } from './contract-templates-service';
+import fs from 'fs';
+import path from 'path';
+import * as os from 'os';
+import { tmpdir } from 'os';
+
+/**
+ * Função utilitária para formatar datas evitando problemas de fuso horário
+ * Ajustada para o fuso horário de Brasília (GMT-3)
+ * @param dateString String de data a ser formatada
+ * @param options Opções de formatação (opcional)
+ * @returns Data formatada no locale pt-BR
+ */
+export function formatDateSafe(dateString: string, options?: Intl.DateTimeFormatOptions): string {
+  // Criar data a partir da string de data 
+  const date = new Date(dateString);
+  
+  // IMPORTANTE: Subtrair 1 dia para ajustar o problema de fuso horário
+  date.setDate(date.getDate() - 1);
+  
+  // Aplicar correção para o fuso horário de Brasília (GMT-3)
+  // Definir para meio-dia UTC para garantir consistência
+  date.setUTCHours(12, 0, 0, 0);
+  
+  // Formatar a data no formato brasileiro
+  return date.toLocaleDateString('pt-BR', options);
+}
+
+/**
+ * Função utilitária para obter o dia do mês de uma data evitando problemas de fuso horário
+ * Ajustada para o fuso horário de Brasília (GMT-3)
+ * @param dateString String de data
+ * @returns O dia do mês (1-31)
+ */
+function getDateDaySafe(dateString: string): number {
+  const date = new Date(dateString);
+  
+  // IMPORTANTE: Subtrair 1 dia para ajustar o problema de fuso horário
+  date.setDate(date.getDate() - 1);
+  
+  // Aplicar correção para o fuso horário de Brasília (GMT-3)
+  // Definir para meio-dia UTC para garantir consistência
+  date.setUTCHours(12, 0, 0, 0);
+  
+  // Retornar o dia do mês ajustado
+  return date.getUTCDate();
+}
+
+// Tipo estendido para o PDFDocument para resolver problemas de tipagem
+type PDFDocumentWithMethods = PDFKit.PDFDocument & {
+  moveTo(x: number, y: number): PDFKit.PDFDocument;
+  lineTo(x: number, y: number): PDFKit.PDFDocument;
+  stroke(): PDFKit.PDFDocument;
+  rect(x: number, y: number, w: number, h: number): PDFKit.PDFDocument;
+  currentLineHeight?(): number;
+};
+
+// Declaração para PDFKit namespace
+declare namespace PDFKit {
+  interface PDFDocument {
+    font(name: string): PDFDocument;
+    fontSize(size: number): PDFDocument;
+    text(text: string, options?: any): PDFDocument;
+    text(text: string, x: number, y: number, options?: any): PDFDocument;
+    moveDown(lines?: number): PDFDocument;
+    addPage(options?: any): PDFDocument;
+    end(): void;
+    pipe(destination: any): any;
+    y: number;
+    page: {
+      width: number;
+      height: number;
+      margins: {
+        top: number;
+        bottom: number;
+        left: number;
+        right: number;
+      };
+    };
+    moveTo(x: number, y: number): PDFDocument;
+    lineTo(x: number, y: number): PDFDocument;
+    stroke(): PDFDocument;
+    rect(x: number, y: number, w: number, h: number): PDFDocument;
+  }
+}
+
+// Tipos para melhorar a legibilidade
+interface ContractData {
+  contract: Contract;
+  owner: Owner;
+  tenant: Tenant;
+  property: Property;
+}
+
+interface PaymentReceiptData {
+  paymentId: number;
+  contractNumber: number;
+  ownerName: string;
+  tenantName: string;
+  propertyAddress: string;
+  paymentValue: number;
+  paymentDate: string;
+  paymentMonth: string;
+}
+
+/**
+ * Converte um valor numérico para texto por extenso em português
+ * @param value Valor a ser convertido (já em reais, não em centavos)
+ */
+function valueToWords(value: number): string {
+  // Se o valor for fornecido como centavos (ex: 115000 representando R$ 1.150,00), 
+  // dividimos por 100 para obter o valor em reais
+  if (value > 9999 && Number.isInteger(value)) {
+    value = value / 100;
+  }
+  
+  if (value === 0) return 'zero reais';
+  
+  const units = ['', 'um', 'dois', 'três', 'quatro', 'cinco', 'seis', 'sete', 'oito', 'nove'];
+  const teens = ['dez', 'onze', 'doze', 'treze', 'quatorze', 'quinze', 'dezesseis', 'dezessete', 'dezoito', 'dezenove'];
+  const tens = ['', '', 'vinte', 'trinta', 'quarenta', 'cinquenta', 'sessenta', 'setenta', 'oitenta', 'noventa'];
+  const hundreds = ['', 'cento', 'duzentos', 'trezentos', 'quatrocentos', 'quinhentos', 'seiscentos', 'setecentos', 'oitocentos', 'novecentos'];
+  
+  let result = '';
+  
+  // Trata reais (parte inteira)
+  const intValue = Math.floor(value);
+  if (intValue > 0) {
+    // Milhares
+    if (intValue >= 1000) {
+      const thousands = Math.floor(intValue / 1000);
+      if (thousands === 1) {
+        result += 'mil ';
+      } else {
+        if (thousands < 10) {
+          result += units[thousands] + ' mil ';
+        } else if (thousands < 20) {
+          result += teens[thousands - 10] + ' mil ';
+        } else {
+          const tenDigit = Math.floor(thousands / 10);
+          const unitDigit = thousands % 10;
+          result += tens[tenDigit];
+          if (unitDigit > 0) {
+            result += ' e ' + units[unitDigit];
+          }
+          result += ' mil ';
+        }
+      }
+    }
+    
+    // Centenas
+    const remainder = intValue % 1000;
+    if (remainder >= 100) {
+      const hundred = Math.floor(remainder / 100);
+      if (remainder === 100) {
+        result += 'cem';
+      } else {
+        result += hundreds[hundred];
+      }
+      
+      const remainderTens = remainder % 100;
+      if (remainderTens > 0) {
+        result += ' e ';
+      }
+    }
+    
+    // Dezenas e Unidades
+    const remainderTens = remainder % 100;
+    if (remainderTens > 0) {
+      if (remainderTens < 10) {
+        result += units[remainderTens];
+      } else if (remainderTens < 20) {
+        result += teens[remainderTens - 10];
+      } else {
+        const tenDigit = Math.floor(remainderTens / 10);
+        const unitDigit = remainderTens % 10;
+        result += tens[tenDigit];
+        if (unitDigit > 0) {
+          result += ' e ' + units[unitDigit];
+        }
+      }
+    }
+    
+    result += intValue === 1 ? ' real' : ' reais';
+  }
+  
+  // Trata centavos
+  const cents = Math.round((value - intValue) * 100);
+  if (cents > 0) {
+    if (intValue > 0) {
+      result += ' e ';
+    }
+    
+    if (cents < 10) {
+      result += units[cents];
+    } else if (cents < 20) {
+      result += teens[cents - 10];
+    } else {
+      const tenDigit = Math.floor(cents / 10);
+      const unitDigit = cents % 10;
+      result += tens[tenDigit];
+      if (unitDigit > 0) {
+        result += ' e ' + units[unitDigit];
+      }
+    }
+    
+    result += cents === 1 ? ' centavo' : ' centavos';
+  }
+  
+  return result;
+}
+
+/**
+ * Adiciona o cabeçalho ao documento PDF
+ */
+function addHeader(doc: PDFDocumentWithMethods, title: string) {
+  doc.font('Helvetica-Bold')
+     .fontSize(16)
+     .text(title, { align: 'center' });
+  
+  doc.moveDown();
+  
+  // Adiciona a data atual
+  const today = new Date();
+  // Ajustar para o horário 15:00 (GMT-3 - Brasília) para evitar problemas de fuso horário
+  today.setHours(15, 0, 0, 0);
+  const formattedDate = today.toLocaleDateString('pt-BR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric'
+  });
+  
+  doc.fontSize(10)
+     .text(`Data de emissão: ${formattedDate}`, { align: 'right' });
+  
+  doc.moveDown(2);
+}
+
+/**
+ * Adiciona as informações das partes contratantes ao documento PDF
+ */
+function addParties(doc: PDFDocumentWithMethods, owner: Owner, tenant: Tenant) {
+  // Formatando as informações do Locador (proprietário)
+  const ownerAddress = typeof owner.address === 'string' 
+    ? JSON.parse(owner.address) 
+    : owner.address;
+  
+  const ownerAddressStr = `${ownerAddress.street}, ${ownerAddress.number}${ownerAddress.complement ? ', ' + ownerAddress.complement : ''}, ${ownerAddress.neighborhood}, ${ownerAddress.city} - ${ownerAddress.state}, CEP: ${ownerAddress.zipCode}`;
+  
+  doc.font('Helvetica-Bold')
+     .fontSize(12)
+     .text('LOCADOR:');
+  
+  doc.font('Helvetica')
+     .fontSize(11)
+     .text(`Nome: ${owner.name}`)
+     .text(`CPF/CNPJ: ${owner.document}`)
+     .text(`Nacionalidade: ${owner.nationality || 'Brasileira'}`)
+     .text(`Profissão: ${owner.profession || 'Não informada'}`)
+     .text(`Estado Civil: ${owner.maritalStatus || 'Não informado'}`)
+     .text(`Cônjuge: ${owner.spouseName || 'Não aplicável'}`)
+     .text(`Endereço: ${ownerAddressStr}`)
+     .text(`Telefone: ${owner.phone}`)
+     .text(`E-mail: ${owner.email}`);
+  
+  doc.moveDown();
+  
+  // Formatando as informações do Locatário (inquilino)
+  const tenantAddress = typeof tenant.address === 'string' 
+    ? JSON.parse(tenant.address) 
+    : tenant.address;
+  
+  const tenantAddressStr = `${tenantAddress.street}, ${tenantAddress.number}${tenantAddress.complement ? ', ' + tenantAddress.complement : ''}, ${tenantAddress.neighborhood}, ${tenantAddress.city} - ${tenantAddress.state}, CEP: ${tenantAddress.zipCode}`;
+  
+  doc.font('Helvetica-Bold')
+     .fontSize(12)
+     .text('LOCATÁRIO:');
+  
+  doc.font('Helvetica')
+     .fontSize(11)
+     .text(`Nome: ${tenant.name}`)
+     .text(`CPF/CNPJ: ${tenant.document}`)
+     .text(`RG: ${tenant.rg || 'Não informado'}`)
+     .text(`Nacionalidade: ${tenant.nationality || 'Brasileira'}`)
+     .text(`Profissão: ${tenant.profession || 'Não informada'}`)
+     .text(`Estado Civil: ${tenant.maritalStatus || 'Não informado'}`)
+     .text(`Cônjuge: ${tenant.spouseName || 'Não aplicável'}`)
+     .text(`Endereço: ${tenantAddressStr}`)
+     .text(`Telefone: ${tenant.phone}`)
+     .text(`E-mail: ${tenant.email}`);
+  
+  // Informações do fiador, se existir
+  const guarantor = tenant.guarantor 
+    ? (typeof tenant.guarantor === 'string' ? JSON.parse(tenant.guarantor) : tenant.guarantor) 
+    : null;
+  
+  if (guarantor && guarantor.name) {
+    doc.moveDown();
+    
+    doc.font('Helvetica-Bold')
+       .fontSize(12)
+       .text('FIADOR:');
+    
+    doc.font('Helvetica')
+       .fontSize(11)
+       .text(`Nome: ${guarantor.name}`)
+       .text(`CPF/CNPJ: ${guarantor.document || 'Não informado'}`)
+       .text(`RG: ${guarantor.rg || 'Não informado'}`)
+       .text(`Nacionalidade: ${guarantor.nationality || 'Brasileira'}`)
+       .text(`Profissão: ${guarantor.profession || 'Não informada'}`)
+       .text(`Estado Civil: ${guarantor.maritalStatus || 'Não informado'}`)
+       .text(`Cônjuge: ${guarantor.spouseName || 'Não aplicável'}`)
+       .text(`Telefone: ${guarantor.phone || 'Não informado'}`)
+       .text(`E-mail: ${guarantor.email || 'Não informado'}`);
+    
+    if (guarantor.address) {
+      const guarantorAddressStr = `${guarantor.address.street}, ${guarantor.address.number}${guarantor.address.complement ? ', ' + guarantor.address.complement : ''}, ${guarantor.address.neighborhood}, ${guarantor.address.city} - ${guarantor.address.state}, CEP: ${guarantor.address.zipCode}`;
+      
+      doc.text(`Endereço: ${guarantorAddressStr}`);
+    }
+  }
+  
+  doc.moveDown(2);
+}
+
+/**
+ * Adiciona as informações do imóvel ao documento PDF
+ */
+function addPropertyInfo(doc: PDFDocumentWithMethods, property: Property, contract?: Contract) {
+  const propertyAddress = typeof property.address === 'string' 
+    ? JSON.parse(property.address) 
+    : property.address;
+  
+  const propertyAddressStr = `${propertyAddress.street}, ${propertyAddress.number}${propertyAddress.complement ? ', ' + propertyAddress.complement : ''}, ${propertyAddress.neighborhood}, ${propertyAddress.city} - ${propertyAddress.state}, CEP: ${propertyAddress.zipCode}`;
+  
+  doc.font('Helvetica-Bold')
+     .fontSize(12)
+     .text('OBJETO DA LOCAÇÃO:');
+  
+  // Usar o valor do contrato (se disponível) ou o valor do imóvel
+  const rentValue = contract ? contract.rentValue : property.rentValue;
+  
+  doc.font('Helvetica')
+     .fontSize(11)
+     .text(`Imóvel: ${property.type.charAt(0).toUpperCase() + property.type.slice(1)}`)
+     .text(`Endereço: ${propertyAddressStr}`)
+     .text(`Valor do Aluguel: R$ ${rentValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)
+     .text(`Área: ${property.area || 'Não informada'} m²`)
+     .text(`Quartos: ${property.bedrooms || 'Não informado'}`)
+     .text(`Banheiros: ${property.bathrooms || 'Não informado'}`);
+  
+  // Adicionar informações de concessionárias, se disponíveis
+  if (property.waterCompany || property.electricityCompany) {
+    doc.moveDown();
+    doc.font('Helvetica-Bold')
+       .text('INFORMAÇÕES DE CONCESSIONÁRIAS:');
+    
+    doc.font('Helvetica');
+    
+    if (property.waterCompany) {
+      doc.text(`Companhia de Água: ${property.waterCompany}`);
+      
+      if (property.waterAccountNumber) {
+        doc.text(`Número da Conta de Água: ${property.waterAccountNumber}`);
+      }
+    }
+    
+    if (property.electricityCompany) {
+      doc.text(`Companhia de Energia: ${property.electricityCompany}`);
+      
+      if (property.electricityAccountNumber) {
+        doc.text(`Número da Conta de Energia: ${property.electricityAccountNumber}`);
+      }
+    }
+  }
+  
+  doc.moveDown(2);
+}
+
+/**
+ * Adiciona cláusulas de contrato residencial ao documento PDF
+ */
+function addResidentialContractClauses(doc: PDFDocumentWithMethods, contract: Contract, property: Property) {
+  const startDate = formatDateSafe(contract.startDate);
+  const endDate = formatDateSafe(contract.endDate);
+  // Todos os valores no sistema estão armazenados em reais
+  const rentValueNum = Number(contract.rentValue);
+  // Usamos o valor diretamente, sem conversão
+  const valueForDisplay = rentValueNum;
+  // Converter para formato de moeda brasileira (R$ 1.150,00)
+  const rentValue = valueForDisplay.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  
+  doc.font('Helvetica-Bold')
+     .fontSize(12)
+     .text('CLÁUSULAS E CONDIÇÕES:');
+  
+  doc.font('Helvetica')
+     .fontSize(11);
+  
+  // Cláusula 1 - Prazo
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 1ª - PRAZO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`A locação terá início em ${startDate} e término em ${endDate}, pelo período de ${contract.duration} meses. Ao término deste prazo, não havendo manifestação por escrito de qualquer das partes, o contrato será prorrogado por prazo indeterminado.`, { align: 'justify' });
+  
+  // Cláusula 2 - Valor e forma de pagamento
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 2ª - VALOR E FORMA DE PAGAMENTO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O aluguel mensal é de R$ ${rentValue} (${valueToWords(valueForDisplay)}), a ser pago até o dia ${getDateDaySafe(contract.firstPaymentDate)} de cada mês, mediante depósito bancário ou outra forma a ser acordada entre as partes.`, { align: 'justify' })
+     .text(`Parágrafo Único: O atraso no pagamento acarretará multa de 10% (dez por cento) sobre o valor do aluguel, além de juros de 1% (um por cento) ao mês, calculados pro rata die.`, { align: 'justify' });
+  
+  // Cláusula 3 - Reajuste
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 3ª - REAJUSTE', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O valor do aluguel será reajustado anualmente, de acordo com a variação do Índice Geral de Preços - Mercado (IGP-M) da Fundação Getúlio Vargas, ou outro índice que vier a substituí-lo.`, { align: 'justify' });
+  
+  // Cláusula 4 - Destinação do imóvel
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 4ª - DESTINAÇÃO DO IMÓVEL', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O imóvel objeto deste contrato destina-se exclusivamente para fins residenciais, não podendo o LOCATÁRIO utilizá-lo para outros fins sem prévia autorização por escrito do LOCADOR.`, { align: 'justify' });
+  
+  // Cláusula 5 - Despesas e encargos
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 5ª - DESPESAS E ENCARGOS', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`Correrão por conta do LOCATÁRIO as despesas com taxas de luz, água, telefone, gás, condomínio e outras taxas que incidam ou venham a incidir sobre o imóvel, bem como o Imposto Predial e Territorial Urbano (IPTU).`, { align: 'justify' });
+  
+  // Cláusula 6 - Conservação e restituição do imóvel
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 6ª - CONSERVAÇÃO E RESTITUIÇÃO DO IMÓVEL', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O LOCATÁRIO obriga-se a conservar o imóvel e a devolvê-lo, ao final da locação, em perfeitas condições de uso e conservação, inclusive com pintura nova, responsabilizando-se pelos danos que porventura sobrevierem ao imóvel durante a locação.`, { align: 'justify' });
+  
+  // Cláusula 7 - Benfeitorias
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 7ª - BENFEITORIAS', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O LOCATÁRIO não poderá fazer no imóvel, sem prévia autorização por escrito do LOCADOR, benfeitorias ou modificações de qualquer natureza. As benfeitorias úteis ou voluptuárias realizadas pelo LOCATÁRIO, ainda que autorizadas, não serão indenizáveis e ficarão incorporadas ao imóvel.`, { align: 'justify' });
+  
+  // Adicionando mais cláusulas se necessário, verificando o espaço disponível na página
+  if (doc.y > 700) {
+    doc.addPage();
+  }
+  
+  // Cláusula 8 - Garantia
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 8ª - GARANTIA', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`Para garantir as obrigações assumidas neste contrato, o LOCATÁRIO apresenta como garantia a fiança prestada por pessoa idônea, qualificada no preâmbulo deste instrumento, que responderá solidariamente por todas as obrigações do LOCATÁRIO.`, { align: 'justify' });
+  
+  // Cláusula 9 - Rescisão
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 9ª - RESCISÃO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O presente contrato poderá ser rescindido a qualquer tempo, por iniciativa de qualquer das partes, mediante notificação por escrito com antecedência mínima de 30 (trinta) dias, ou imediatamente, no caso de descumprimento de qualquer cláusula contratual.`, { align: 'justify' });
+  
+  // Cláusula 10 - Foro
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 10ª - FORO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`Fica eleito o foro da comarca onde se localiza o imóvel para dirimir quaisquer dúvidas ou controvérsias oriundas do presente contrato, com renúncia expressa a qualquer outro, por mais privilegiado que seja.`, { align: 'justify' });
+  
+  doc.moveDown();
+  doc.text(`E por estarem justos e contratados, as partes assinam o presente instrumento em 02 (duas) vias de igual teor e forma, na presença de 02 (duas) testemunhas, para que produza seus efeitos legais.`, { align: 'justify' });
+  
+  doc.moveDown(2);
+}
+
+/**
+ * Renderiza um template HTML no PDF com formatação apropriada
+ */
+function renderHTMLTemplate(doc: PDFDocumentWithMethods, content: string) {
+  // Dividir o conteúdo do modelo em parágrafos
+  const paragraphs = content.split('\n\n');
+  
+  for (const paragraph of paragraphs) {
+    if (!paragraph.trim()) {
+      doc.moveDown();
+      continue;
+    }
+    
+    let text = paragraph;
+    let align = 'justify'; // alinhamento padrão
+    
+    // Verificar se há div com alinhamento
+    const alignMatch = text.match(/<div\s+style="text-align:\s*(left|center|right|justify);">(.*?)<\/div>/s);
+    if (alignMatch) {
+      align = alignMatch[1];
+      text = alignMatch[2];
+    }
+    
+    // Verificar se o texto tem tag de negrito
+    if (text.includes('<b>')) {
+      // Aplicar fonte negrito e renderizar
+      doc.font('Helvetica-Bold').text(text.replace(/<\/?b>/g, ''), { align }).font('Helvetica');
+    } 
+    // Verificar se o texto tem tag de itálico
+    else if (text.includes('<i>')) {
+      // Aplicar fonte itálica e renderizar
+      doc.font('Helvetica-Oblique').text(text.replace(/<\/?i>/g, ''), { align }).font('Helvetica');
+    }
+    // Verificar se é um título com #
+    else if (text.match(/^(#{1,6})\s+(.*)$/)) {
+      const headerMatch = text.match(/^(#{1,6})\s+(.*)$/);
+      if (headerMatch) {
+        const level = headerMatch[1].length;
+        const headerText = headerMatch[2];
+        
+        // Ajustar o tamanho da fonte com base no nível do cabeçalho
+        const fontSize = 16 - (level - 1) * 2;
+        doc.font('Helvetica-Bold').fontSize(fontSize).text(headerText, { align }).font('Helvetica').fontSize(10);
+      }
+    }
+    // Texto normal com qualquer outra formatação
+    else {
+      // Remover quaisquer tags HTML restantes
+      text = text
+        .replace(/<b>(.*?)<\/b>/g, "$1")
+        .replace(/<i>(.*?)<\/i>/g, "$1")
+        .replace(/<u>(.*?)<\/u>/g, "$1")
+        .replace(/<span[^>]*>(.*?)<\/span>/g, "$1")
+        .replace(/<div[^>]*>(.*?)<\/div>/g, "$1")
+        .replace(/<[^>]*>/g, "");
+      
+      doc.text(text, { align });
+    }
+    
+    doc.moveDown();
+  }
+}
+
+/**
+ * Adiciona cláusulas de contrato comercial ao documento PDF
+ */
+function addCommercialContractClauses(doc: PDFDocumentWithMethods, contract: Contract, property: Property) {
+  const startDate = formatDateSafe(contract.startDate);
+  const endDate = formatDateSafe(contract.endDate);
+  // Todos os valores no sistema estão armazenados em reais
+  const rentValueNum = Number(contract.rentValue);
+  // Usamos o valor diretamente, sem conversão
+  const valueForDisplay = rentValueNum;
+  // Converter para formato de moeda brasileira (R$ 1.150,00)
+  const rentValue = valueForDisplay.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  
+  doc.font('Helvetica-Bold')
+     .fontSize(12)
+     .text('CLÁUSULAS E CONDIÇÕES:');
+  
+  doc.font('Helvetica')
+     .fontSize(11);
+  
+  // Cláusula 1 - Prazo
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 1ª - PRAZO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`A locação terá início em ${startDate} e término em ${endDate}, pelo período de ${contract.duration} meses. Ao término deste prazo, não havendo manifestação por escrito de qualquer das partes, o contrato será prorrogado por prazo indeterminado.`, { align: 'justify' });
+  
+  // Cláusula 2 - Valor e forma de pagamento
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 2ª - VALOR E FORMA DE PAGAMENTO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O aluguel mensal é de R$ ${rentValue} (${valueToWords(valueForDisplay)}), a ser pago até o dia ${getDateDaySafe(contract.firstPaymentDate)} de cada mês, mediante depósito bancário ou outra forma a ser acordada entre as partes.`, { align: 'justify' })
+     .text(`Parágrafo Único: O atraso no pagamento acarretará multa de 10% (dez por cento) sobre o valor do aluguel, além de juros de 1% (um por cento) ao mês, calculados pro rata die.`, { align: 'justify' });
+  
+  // Cláusula 3 - Reajuste
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 3ª - REAJUSTE', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O valor do aluguel será reajustado anualmente, de acordo com a variação do Índice Geral de Preços - Mercado (IGP-M) da Fundação Getúlio Vargas, ou outro índice que vier a substituí-lo.`, { align: 'justify' });
+  
+  // Cláusula 4 - Destinação do imóvel
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 4ª - DESTINAÇÃO DO IMÓVEL', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O imóvel objeto deste contrato destina-se exclusivamente para fins comerciais, não podendo o LOCATÁRIO utilizá-lo para outros fins sem prévia autorização por escrito do LOCADOR.`, { align: 'justify' });
+  
+  // Cláusula 5 - Despesas e encargos
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 5ª - DESPESAS E ENCARGOS', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`Correrão por conta do LOCATÁRIO as despesas com taxas de luz, água, telefone, gás, condomínio e outras taxas que incidam ou venham a incidir sobre o imóvel, bem como o Imposto Predial e Territorial Urbano (IPTU).`, { align: 'justify' });
+  
+  // Cláusula 6 - Conservação e restituição do imóvel
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 6ª - CONSERVAÇÃO E RESTITUIÇÃO DO IMÓVEL', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O LOCATÁRIO obriga-se a conservar o imóvel e a devolvê-lo, ao final da locação, em perfeitas condições de uso e conservação, inclusive com pintura nova, responsabilizando-se pelos danos que porventura sobrevierem ao imóvel durante a locação.`, { align: 'justify' });
+  
+  // Cláusula 7 - Benfeitorias
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 7ª - BENFEITORIAS', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O LOCATÁRIO não poderá fazer no imóvel, sem prévia autorização por escrito do LOCADOR, benfeitorias ou modificações de qualquer natureza. As benfeitorias úteis ou voluptuárias realizadas pelo LOCATÁRIO, ainda que autorizadas, não serão indenizáveis e ficarão incorporadas ao imóvel.`, { align: 'justify' });
+  
+  // Adicionando mais cláusulas se necessário, verificando o espaço disponível na página
+  if (doc.y > 700) {
+    doc.addPage();
+  }
+  
+  // Cláusula 8 - Garantia
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 8ª - GARANTIA', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`Para garantir as obrigações assumidas neste contrato, o LOCATÁRIO apresenta como garantia a fiança prestada por pessoa idônea, qualificada no preâmbulo deste instrumento, que responderá solidariamente por todas as obrigações do LOCATÁRIO.`, { align: 'justify' });
+  
+  // Cláusula 9 - Rescisão
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 9ª - RESCISÃO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`O presente contrato poderá ser rescindido a qualquer tempo, por iniciativa de qualquer das partes, mediante notificação por escrito com antecedência mínima de 30 (trinta) dias, ou imediatamente, no caso de descumprimento de qualquer cláusula contratual.`, { align: 'justify' });
+  
+  // Cláusula 10 - Foro
+  doc.moveDown();
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA 10ª - FORO', { underline: true });
+  
+  doc.font('Helvetica')
+     .text(`Fica eleito o foro da comarca onde se localiza o imóvel para dirimir quaisquer dúvidas ou controvérsias oriundas do presente contrato, com renúncia expressa a qualquer outro, por mais privilegiado que seja.`, { align: 'justify' });
+  
+  doc.moveDown();
+  doc.text(`E por estarem justos e contratados, as partes assinam o presente instrumento em 02 (duas) vias de igual teor e forma, na presença de 02 (duas) testemunhas, para que produza seus efeitos legais.`, { align: 'justify' });
+  
+  doc.moveDown(2);
+}
+
+/**
+ * Adiciona campos para assinatura ao documento PDF
+ */
+function addSignatureFields(doc: PDFDocumentWithMethods, owner: Owner, tenant: Tenant) {
+  const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const colWidth = pageWidth / 2;
+  
+  // Garantir que as assinaturas e testemunhas fiquem na mesma página
+  // Se estiver próximo do final da página, adicionar nova página
+  // Senão, apenas adicionar espaço suficiente
+  if (doc.y > 500) {
+    doc.addPage();
+  } else {
+    doc.moveDown(2);
+  }
+  
+  // Adicionar local e data
+  const today = new Date();
+  // Ajustar para o horário 15:00 (GMT-3 - Brasília) para evitar problemas de fuso horário
+  today.setHours(15, 0, 0, 0);
+  const formattedDate = today.toLocaleDateString('pt-BR', {
+    day: '2-digit',
+    month: 'long',
+    year: 'numeric'
+  });
+  
+  doc.fontSize(11)
+     .text(`Local e data: ___________________________, ${formattedDate}`, { align: 'center' });
+  
+  doc.moveDown(2);
+  
+  doc.fontSize(11);
+  
+  doc.moveDown(2);
+  
+  // Assinaturas
+  doc.text('_______________________________', doc.page.margins.left, doc.y, { width: colWidth, align: 'center' });
+  doc.text('Locador', doc.page.margins.left, doc.y, { width: colWidth, align: 'center' });
+  doc.text(`${owner.name}`, doc.page.margins.left, doc.y, { width: colWidth, align: 'center' });
+  
+  doc.text('_______________________________', doc.page.margins.left + colWidth, doc.y - 20, { width: colWidth, align: 'center' });
+  doc.text('Locatário', doc.page.margins.left + colWidth, doc.y, { width: colWidth, align: 'center' });
+  doc.text(`${tenant.name}`, doc.page.margins.left + colWidth, doc.y, { width: colWidth, align: 'center' });
+  
+  doc.moveDown(3);
+  
+  // Testemunhas
+  doc.text('TESTEMUNHAS:', { align: 'left' });
+  
+  doc.moveDown(1);
+  
+  // Primeira testemunha (à esquerda)
+  doc.text('1) _______________________________', doc.page.margins.left, doc.y, { width: colWidth, align: 'left' });
+  doc.text('Nome: _____________________________', doc.page.margins.left, doc.y, { width: colWidth, align: 'left' });
+  doc.text('CPF: ______________________________', doc.page.margins.left, doc.y, { width: colWidth, align: 'left' });
+  
+  // Segunda testemunha (à direita)
+  const yPosAfterFirstWitness = doc.y;
+  doc.text('2) _______________________________', doc.page.margins.left + colWidth, yPosAfterFirstWitness - 30, { width: colWidth, align: 'left' });
+  doc.text('Nome: _____________________________', doc.page.margins.left + colWidth, doc.y, { width: colWidth, align: 'left' });
+  doc.text('CPF: ______________________________', doc.page.margins.left + colWidth, doc.y, { width: colWidth, align: 'left' });
+}
+
+// Endpoints para PDFs
+
+export async function generateResidentialContractPDF(req: Request, res: Response) {
+  try {
+    const contractId = Number(req.params.id);
+    const templateId = req.query.templateId ? Number(req.query.templateId) : undefined;
+    const contract = await storage.getContract(contractId);
+    
+    if (!contract) {
+      return res.status(404).json({ error: 'Contrato não encontrado' });
+    }
+    
+    const [owner, tenant, property] = await Promise.all([
+      storage.getOwner(contract.ownerId),
+      storage.getTenant(contract.tenantId),
+      storage.getProperty(contract.propertyId)
+    ]);
+    
+    if (!owner || !tenant || !property) {
+      return res.status(404).json({ error: 'Dados relacionados não encontrados' });
+    }
+    
+    // Criar um arquivo temporário para o PDF
+    const tempFilePath = path.join(tmpdir(), `contrato_residencial_${contractId}_${Date.now()}.pdf`);
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: {
+        top: 50,
+        bottom: 50,
+        left: 50,
+        right: 50
+      },
+      info: {
+        Title: `Contrato de Locação Residencial - ${owner.name} e ${tenant.name}`,
+        Author: 'Sistema de Gestão de Contratos de Aluguel',
+        Subject: 'Contrato de Locação Residencial',
+        Keywords: 'aluguel, contrato, locação, residencial',
+        CreationDate: new Date(),
+      }
+    }) as PDFDocumentWithMethods;
+    
+    // Pipe o PDF para o arquivo temporário
+    const writeStream = fs.createWriteStream(tempFilePath);
+    doc.pipe(writeStream);
+    
+    // Verificar se deve usar um modelo de contrato específico
+    let useTemplate = true;
+    try {
+      // Se tiver um ID de modelo específico ou se deve buscar um modelo ativo do tipo residencial
+      // Import já feito no topo do arquivo
+      
+      const templateData = { owner, tenant, property, contract };
+      let templateContent;
+      
+      if (templateId) {
+        // Usar modelo específico pelo ID
+        templateContent = await getProcessedTemplate(templateId, templateData);
+      } else {
+        // Tentar obter modelo ativo do tipo residencial
+        try {
+          templateContent = await getProcessedTemplateByType('residential', templateData);
+        } catch (err) {
+          // Se não encontrar modelo ativo, usar o formato padrão
+          useTemplate = false;
+        }
+      }
+      
+      if (useTemplate && templateContent) {
+        // Não adicionar cabeçalho padrão ao PDF quando usando template customizado
+        // O cabeçalho personalizado já deve estar incluído no template
+        
+        // Renderizar o conteúdo do modelo processado
+        doc.font('Helvetica').fontSize(10);
+        
+        // Usar a função de renderização de template HTML
+        renderHTMLTemplate(doc, templateContent);
+        }
+        
+        // Adicionar campos para assinatura
+        // Removido para evitar rodapé automático em templates personalizados: addSignatureFields(doc, owner, tenant);
+      } else {
+        // Usar formato padrão original
+        useTemplate = false;
+      }
+    } catch (templateError) {
+      console.error("Erro ao processar modelo de contrato:", templateError);
+      useTemplate = false;
+    }
+    
+    // Se não usar modelo ou ocorrer erro, usar o formato padrão original
+    if (!useTemplate) {
+      // Adicionar conteúdo ao PDF
+      addHeader(doc, 'CONTRATO DE LOCAÇÃO RESIDENCIAL');
+      addParties(doc, owner, tenant);
+      addPropertyInfo(doc, property, contract);
+      addResidentialContractClauses(doc, contract, property);
+      addSignatureFields(doc, owner, tenant);
+    }
+    
+    // Finalizar o documento
+    doc.end();
+    
+    // Quando o stream terminar, envie o arquivo para o cliente
+    writeStream.on('finish', () => {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="contrato_residencial_${contractId}.pdf"`);
+      
+      const readStream = fs.createReadStream(tempFilePath);
+      readStream.pipe(res);
+      
+      // Limpar o arquivo temporário após o envio
+      readStream.on('end', () => {
+        fs.unlink(tempFilePath, (err) => {
+          if (err) console.error('Erro ao excluir arquivo temporário:', err);
+        });
+      });
+    });
+  } catch (error) {
+    console.error('Erro ao gerar PDF do contrato residencial:', error);
+    res.status(500).json({ error: 'Erro ao gerar PDF do contrato residencial' });
+  }
+}
+
+export async function generateCommercialContractPDF(req: Request, res: Response) {
+  try {
+    const contractId = Number(req.params.id);
+    const templateId = req.query.templateId ? Number(req.query.templateId) : undefined;
+    const contract = await storage.getContract(contractId);
+    
+    if (!contract) {
+      return res.status(404).json({ error: 'Contrato não encontrado' });
+    }
+    
+    const [owner, tenant, property] = await Promise.all([
+      storage.getOwner(contract.ownerId),
+      storage.getTenant(contract.tenantId),
+      storage.getProperty(contract.propertyId)
+    ]);
+    
+    if (!owner || !tenant || !property) {
+      return res.status(404).json({ error: 'Dados relacionados não encontrados' });
+    }
+    
+    // Criar um arquivo temporário para o PDF
+    const tempFilePath = path.join(tmpdir(), `contrato_comercial_${contractId}_${Date.now()}.pdf`);
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: {
+        top: 50,
+        bottom: 50,
+        left: 50,
+        right: 50
+      },
+      info: {
+        Title: `Contrato de Locação Comercial - ${owner.name} e ${tenant.name}`,
+        Author: 'Sistema de Gestão de Contratos de Aluguel',
+        Subject: 'Contrato de Locação Comercial',
+        Keywords: 'aluguel, contrato, locação, comercial',
+        CreationDate: new Date(),
+      }
+    }) as PDFDocumentWithMethods;
+    
+    // Pipe o PDF para o arquivo temporário
+    const writeStream = fs.createWriteStream(tempFilePath);
+    doc.pipe(writeStream);
+    
+    // Verificar se deve usar um modelo de contrato específico
+    let useTemplate = true;
+    try {
+      // Se tiver um ID de modelo específico ou se deve buscar um modelo ativo do tipo comercial
+      // Import já feito no topo do arquivo
+      
+      const templateData = { owner, tenant, property, contract };
+      let templateContent;
+      
+      if (templateId) {
+        // Usar modelo específico pelo ID
+        templateContent = await getProcessedTemplate(templateId, templateData);
+      } else {
+        // Tentar obter modelo ativo do tipo comercial
+        try {
+          templateContent = await getProcessedTemplateByType('commercial', templateData);
+        } catch (err) {
+          // Se não encontrar modelo ativo, usar o formato padrão
+          useTemplate = false;
+        }
+      }
+      
+      if (useTemplate && templateContent) {
+        // Não adicionar cabeçalho padrão ao PDF quando usando template customizado
+        // O cabeçalho personalizado já deve estar incluído no template
+        
+        // Renderizar o conteúdo do modelo processado
+        doc.font('Helvetica').fontSize(10);
+        
+        // Substituir tags HTML por formatação do PDFKit
+        templateContent = templateContent
+          .replace(/<b>(.*?)<\/b>/g, "$1") // Remover tags de negrito (o PDFKit tratará o texto)
+          .replace(/<i>(.*?)<\/i>/g, "$1") // Remover tags de itálico
+          .replace(/<u>(.*?)<\/u>/g, "$1") // Remover tags de sublinhado
+          .replace(/<div[^>]*>(.*?)<\/div>/g, "$1"); // Remover divs
+        
+        // Dividir o conteúdo do modelo em parágrafos
+        const paragraphs = templateContent.split('\n\n');
+        
+        for (const paragraph of paragraphs) {
+          // Verificar se tem formatação de negrito
+          const boldMatch = paragraph.match(/<b>(.*?)<\/b>/);
+          if (boldMatch) {
+            doc.font('Helvetica-Bold').text(boldMatch[1]).font('Helvetica');
+          } else {
+            // Verificar se é um título com # 
+            const headerMatch = paragraph.match(/^(#{1,6})\s+(.*)$/);
+            if (headerMatch) {
+              const level = headerMatch[1].length;
+              const text = headerMatch[2];
+              
+              // Ajustar o tamanho da fonte com base no nível do cabeçalho
+              const fontSize = 16 - (level - 1) * 2;
+              doc.font('Helvetica-Bold').fontSize(fontSize).text(text).font('Helvetica').fontSize(10);
+            } else {
+              // Texto normal
+              doc.text(paragraph, { align: 'justify' });
+            }
+        // Usar a função de renderização de template HTML
+        renderHTMLTemplate(doc, templateContent);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="contrato_comercial_${contractId}.pdf"`);
+      
+      const readStream = fs.createReadStream(tempFilePath);
+      readStream.pipe(res);
+      
+      // Limpar o arquivo temporário após o envio
+      readStream.on('end', () => {
+        fs.unlink(tempFilePath, (err) => {
+          if (err) console.error('Erro ao excluir arquivo temporário:', err);
+        });
+      });
+    });
+  } catch (error) {
+    console.error('Erro ao gerar PDF do contrato comercial:', error);
+    res.status(500).json({ error: 'Erro ao gerar PDF do contrato comercial' });
+  }
+}
+
+/**
+ * Interface para renovação de contrato com dados necessários para gerar aditivo
+ */
+interface ContractRenewalData {
+  renewal: ContractRenewal;
+  originalContract: Contract;
+  newContract: Contract;
+  owner: Owner;
+  tenant: Tenant;
+  property: Property;
+}
+
+/**
+ * Converte um número para por extenso em português (sem adicionar "reais" ou "centavos")
+ * @param num O número a ser convertido por extenso
+ */
+function numberToWords(num: number): string {
+  // Arrays com os nomes dos números
+  const units = ['zero', 'um', 'dois', 'três', 'quatro', 'cinco', 'seis', 'sete', 'oito', 'nove'];
+  const teens = ['dez', 'onze', 'doze', 'treze', 'quatorze', 'quinze', 'dezesseis', 'dezessete', 'dezoito', 'dezenove'];
+  const tens = ['', 'dez', 'vinte', 'trinta', 'quarenta', 'cinquenta', 'sessenta', 'setenta', 'oitenta', 'noventa'];
+  
+  // Se o número for zero
+  if (num === 0) return 'zero';
+  
+  // Para números inteiros entre 1 e 99
+  if (num < 10) {
+    return units[num];
+  } else if (num < 20) {
+    return teens[num - 10];
+  } else if (num < 100) {
+    const tenDigit = Math.floor(num / 10);
+    const unitDigit = num % 10;
+    if (unitDigit === 0) {
+      return tens[tenDigit];
+    } else {
+      return `${tens[tenDigit]} e ${units[unitDigit]}`;
+    }
+  }
+  
+  return num.toString(); // Para números maiores, retorna como string numérica
+}
+
+/**
+ * Adiciona as cláusulas do termo aditivo de renovação de contrato ao documento PDF
+ */
+export function addContractRenewalClauses(doc: PDFDocumentWithMethods, renewalData: ContractRenewalData) {
+  const { renewal, originalContract, newContract, owner, tenant, property } = renewalData;
+  
+  // Função auxiliar para padronizar e formatar datas
+  function formatDateConsistently(dateString: string): string {
+    // Criar novo objeto Date, padronizar para meio-dia (12h) para evitar problemas de fuso horário
+    const date = new Date(dateString);
+    
+    // IMPORTANTE: Subtrair 1 dia para ajustar o problema de fuso horário
+    date.setDate(date.getDate() - 1);
+    
+    // Ajuste completo para evitar qualquer mudança adicional por conta do fuso horário
+    date.setUTCHours(12, 0, 0, 0);
+    
+    // Formatação para o padrão brasileiro (dia/mês/ano)
+    const day = date.getUTCDate().toString().padStart(2, '0');
+    const month = (date.getUTCMonth() + 1).toString().padStart(2, '0');
+    const year = date.getUTCFullYear();
+    
+    return `${day}/${month}/${year}`;
+  }
+  
+  // Aplicar a formatação padronizada a todas as datas
+  const originalStartDate = formatDateConsistently(originalContract.startDate);
+  const originalEndDate = formatDateConsistently(originalContract.endDate);
+  const newStartDate = formatDateConsistently(newContract.startDate);
+  const newEndDate = formatDateConsistently(newContract.endDate);
+  
+  // Formatação de valores
+  const originalRentValue = originalContract.rentValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const newRentValue = renewal.newRentValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  
+  // Layout exatamente como o modelo fornecido, mas com espaçamentos menores
+  doc.font('Helvetica-Bold')
+     .fontSize(12)
+     .text('TERMO ADITIVO DE RENOVAÇÃO CONTRATUAL DE LOCAÇÃO', { align: 'center' });
+  
+  doc.moveDown(0.3);
+  
+  // Texto de introdução
+  doc.font('Helvetica')
+     .fontSize(9)
+     .text('Pelo presente instrumento particular, as partes abaixo qualificadas:', { align: 'justify' });
+  
+  // LOCADOR - com dados dinâmicos do proprietário
+  doc.moveDown(0.5);
+  doc.font('Helvetica-Bold')
+     .text('LOCADOR: ', { continued: true })
+     .font('Helvetica')
+     .text(`${owner.name}, brasileiro, ${owner.profession || 'aposentado'}, portador do CPF nº ${owner.document}, ${owner.maritalStatus || 'casado'}, residente e domiciliado à ${owner.address && typeof owner.address !== 'string' ? `${owner.address.street}, nº ${owner.address.number}${owner.address.complement ? ', ' + owner.address.complement : ''}, ${owner.address.neighborhood}, ${owner.address.city}/${owner.address.state}` : owner.address && typeof owner.address === 'string' ? JSON.parse(owner.address).street + ', nº ' + JSON.parse(owner.address).number + (JSON.parse(owner.address).complement ? ', ' + JSON.parse(owner.address).complement : '') + ', ' + JSON.parse(owner.address).neighborhood + ', ' + JSON.parse(owner.address).city + '/' + JSON.parse(owner.address).state : '[endereço completo]'};`, { align: 'justify' });
+  
+  // LOCATÁRIO - com dados dinâmicos do inquilino
+  doc.moveDown(0.8);
+  doc.font('Helvetica-Bold')
+     .text('LOCATÁRIO: ', { continued: true })
+     .font('Helvetica')
+     .text(`${tenant.name}, brasileiro, ${tenant.profession || '[profissão]'}, portador do CPF nº ${tenant.document}${tenant.rg ? ' e do RG nº ' + tenant.rg : ''}, ${tenant.maritalStatus || '[estado civil]'}, residente e domiciliado à ${tenant.address && typeof tenant.address !== 'string' ? `${tenant.address.street}, nº ${tenant.address.number}${tenant.address.complement ? ', ' + tenant.address.complement : ''}, ${tenant.address.neighborhood}, ${tenant.address.city}/${tenant.address.state}` : tenant.address && typeof tenant.address === 'string' ? JSON.parse(tenant.address).street + ', nº ' + JSON.parse(tenant.address).number + (JSON.parse(tenant.address).complement ? ', ' + JSON.parse(tenant.address).complement : '') + ', ' + JSON.parse(tenant.address).neighborhood + ', ' + JSON.parse(tenant.address).city + '/' + JSON.parse(tenant.address).state : '[endereço completo]'};`, { align: 'justify' });
+  
+  // FIADOR - com dados dinâmicos do fiador (se disponível)
+  const hasGuarantor = tenant.guarantor && (typeof tenant.guarantor !== 'string' || tenant.guarantor.length > 0);
+  
+  if (hasGuarantor) {
+    const guarantor = typeof tenant.guarantor === 'string' ? JSON.parse(tenant.guarantor) : tenant.guarantor;
+    
+    doc.moveDown(0.8);
+    doc.font('Helvetica-Bold')
+       .text('FIADOR(A): ', { continued: true })
+       .font('Helvetica')
+       .text(`${guarantor.name || 'STELA APARECIDA TOMAZ'}, brasileiro(a), ${guarantor.profession || '[profissão]'}, ${guarantor.maritalStatus || '[estado civil]'}, portador(a) do CPF nº ${guarantor.document || '025.862.886-37'}${guarantor.rg ? ' e do RG nº ' + guarantor.rg : ''}, residente à ${guarantor.address ? (typeof guarantor.address === 'string' ? JSON.parse(guarantor.address).street + ', nº ' + JSON.parse(guarantor.address).number + (JSON.parse(guarantor.address).complement ? ', ' + JSON.parse(guarantor.address).complement : '') + ', ' + JSON.parse(guarantor.address).neighborhood + ', ' + JSON.parse(guarantor.address).city + '/' + JSON.parse(guarantor.address).state : `${guarantor.address.street}, nº ${guarantor.address.number}${guarantor.address.complement ? ', ' + guarantor.address.complement : ''}, ${guarantor.address.neighborhood}, ${guarantor.address.city}/${guarantor.address.state}`) : 'Rua Nossa Senhora do Pilar, nº 320, Bairro Cruzeiro, Nova Lima/MG'};`, { align: 'justify' });
+  }
+  
+  // Considerandos - usando as datas dinâmicas do contrato original
+  doc.moveDown(1.2);
+  doc.font('Helvetica')
+     .text(`Considerando que as partes celebraram um Contrato de Locação nº ${originalContract.id}, com vigência de ${originalContract.duration} (${numberToWords(originalContract.duration).toLowerCase()}) meses, iniciada em ${originalStartDate} e término em ${originalEndDate};`, { align: 'justify' });
+  
+  doc.moveDown(0.3);
+  doc.text(`E, considerando o interesse mútuo na prorrogação da locação por novo período, resolvem firmar o presente Termo Aditivo, que se regerá pelas cláusulas e condições seguintes:`, { align: 'justify' });
+  
+  // Linha divisória
+  doc.moveDown(0.3);
+  doc.text('________________________________________', { align: 'center' });
+  
+  // CLÁUSULA PRIMEIRA - usando datas dinâmicas do contrato original
+  doc.moveDown(0.3);
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA PRIMEIRA – PRORROGAÇÃO DA VIGÊNCIA', { align: 'center' });
+  
+  // Para exibir o número exato de meses conforme exibido na interface, usamos a duração do contrato diretamente
+  // em vez de calcular a diferença entre as datas para evitar problemas com fuso horário
+  const durationInMonths = newContract.duration;
+  
+  doc.font('Helvetica')
+     .text(`O contrato de locação será prorrogado por mais ${durationInMonths} (${numberToWords(durationInMonths).toLowerCase()}) meses, com início em ${newStartDate} e término previsto para ${newEndDate}, sem solução de continuidade em relação ao contrato original nº ${renewalData.originalContract.id}.`, { align: 'justify' });
+  
+  // Linha divisória
+  doc.moveDown(0.3);
+  doc.text('________________________________________', { align: 'center' });
+  
+  // CLÁUSULA SEGUNDA - corrigida para usar o dia do primeiro vencimento do contrato
+  doc.moveDown(0.3);
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA SEGUNDA – VALOR DO ALUGUEL E REAJUSTE', { align: 'center' });
+  
+  // Obtendo o dia do primeiro vencimento do contrato original
+  const firstPaymentDay = getDateDaySafe(newContract.firstPaymentDate);
+  
+  // Formatar o novo valor do aluguel
+  const formattedRentValue = renewal.newRentValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const rentValueInWords = valueToWords(renewal.newRentValue);
+  
+  // Obter o mês e ano do início do contrato para referenciar no texto
+  // Criar data UTC para evitar problemas de fuso horário
+  const startDate = new Date(newContract.startDate);
+  startDate.setUTCHours(12, 0, 0, 0); // Meio-dia UTC para evitar problemas de fuso horário
+  
+  // Obter os nomes dos meses em português
+  const months = [
+    'janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho',
+    'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'
+  ];
+  
+  const startMonth = months[startDate.getUTCMonth()];
+  const startYear = startDate.getUTCFullYear();
+  
+  doc.font('Helvetica')
+     .text(`O valor mensal do aluguel será reajustado para R$ ${formattedRentValue} (${rentValueInWords}), com vencimento no dia ${firstPaymentDay} (${numberToWords(firstPaymentDay).toLowerCase()}) de cada mês, a partir de ${startMonth} de ${startYear}.`, { align: 'justify' });
+  
+  doc.moveDown(0.3);
+  doc.text(`O valor será corrigido anualmente com base no índice IGPM-FGV acumulado, ou, na sua ausência, por outro índice oficial que venha a substituí-lo, conforme a legislação vigente.`, { align: 'justify' });
+  
+  // Linha divisória
+  doc.moveDown(0.3);
+  doc.text('________________________________________', { align: 'center' });
+  
+  // CLÁUSULA TERCEIRA - exatamente como no modelo
+  doc.moveDown(0.3);
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA TERCEIRA – RATIFICAÇÃO DAS DEMAIS CLÁUSULAS', { align: 'center' });
+  
+  doc.font('Helvetica')
+     .text(`Ficam ratificadas todas as demais cláusulas e condições do contrato original de locação, que permanecem inalteradas e em pleno vigor.`, { align: 'justify' });
+  
+  // Linha divisória
+  doc.moveDown(0.3);
+  doc.text('________________________________________', { align: 'center' });
+  
+  // CLÁUSULA QUARTA - exatamente como no modelo
+  doc.moveDown(0.3);
+  doc.font('Helvetica-Bold')
+     .text('CLÁUSULA QUARTA – DISPOSIÇÕES FINAIS', { align: 'center' });
+  
+  doc.font('Helvetica')
+     .text(`Por estarem justas e acordadas, as partes assinam o presente Termo Aditivo em 2 (duas) vias de igual teor, juntamente com 2 (duas) testemunhas, para que produza seus efeitos legais.`, { align: 'justify' });
+  
+  // Local e data - usando formatação consistente para data atual
+  const today = new Date();
+  today.setUTCHours(12, 0, 0, 0); // Meio-dia UTC para evitar problemas de fuso horário
+  
+  // Formatação consistente para o dia
+  const day = today.getUTCDate();
+  
+  // Usar o mesmo array de meses em português definido anteriormente
+  const month = months[today.getUTCMonth()];
+  const year = today.getUTCFullYear();
+  
+  doc.moveDown(1.0);
+  doc.text(`Nova Lima/MG, ____ de ${month} de ${year}.`, { align: 'justify' });
+  
+  // Linha divisória
+  doc.moveDown(0.3);
+  doc.text('________________________________________', { align: 'center' });
+  
+  // Espaço adicional de 3 linhas após a data
+  doc.moveDown(3.0);
+  
+  // Assinatura do Locador
+  doc.text('_______________________________________________________________________', { align: 'center' });
+  doc.text(`${owner.name.toUpperCase()}`, { align: 'center' });
+  doc.text('LOCADOR', { align: 'center' });
+  
+  // Espaço entre as assinaturas
+  doc.moveDown(2);
+  
+  // Assinatura do Locatário
+  doc.text('________________________________________________________________________', { align: 'center' });
+  doc.text(`${tenant.name.toUpperCase()}`, { align: 'center' });
+  doc.text('LOCATÁRIO', { align: 'center' });
+  
+  // Espaço entre as assinaturas
+  doc.moveDown(2);
+  
+  // Assinatura da Fiadora (se houver)
+  if (tenant.guarantor && (typeof tenant.guarantor !== 'string' || tenant.guarantor.length > 0)) {
+    const guarantor = typeof tenant.guarantor === 'string' ? JSON.parse(tenant.guarantor) : tenant.guarantor;
+    
+    doc.text('______________________________________________________________________', { align: 'center' });
+    doc.text(`${(guarantor.name || 'STELA APARECIDA TOMAZ').toUpperCase()}`, { align: 'center' });
+    doc.text('FIADOR(A)', { align: 'center' });
+  }
+  
+  // Testemunhas - com menos espaçamento
+  doc.moveDown(0.5);
+  doc.text('Testemunhas:', { align: 'left' });
+  
+  doc.moveDown(0.5);
+  doc.text('1.____________________________________________________________________', { align: 'left' });
+  doc.text('Nome:', { align: 'left' });
+  doc.text('CPF:', { align: 'left' });
+  
+  doc.moveDown(0.5);
+  doc.text('2.____________________________________________________________________', { align: 'left' });
+  doc.text('Nome:', { align: 'left' });
+  doc.text('CPF:', { align: 'left' });
+}
+
+/**
+ * Gera um PDF do termo aditivo de renovação de contrato
+ */
+export async function generateContractRenewalPDF(req: Request, res: Response) {
+  try {
+    const renewalId = Number(req.params.id);
+    const renewal = await storage.getContractRenewal(renewalId);
+    
+    if (!renewal) {
+      return res.status(404).json({ error: 'Renovação de contrato não encontrada' });
+    }
+    
+    // Primeiro buscar contratos para obter os IDs
+    const [originalContract, newContract] = await Promise.all([
+      storage.getContract(renewal.originalContractId),
+      storage.getContract(renewal.contractId)
+    ]);
+    
+    if (!originalContract || !newContract) {
+      return res.status(404).json({ error: 'Contratos relacionados não encontrados' });
+    }
+    
+    // Depois buscar proprietário, inquilino e imóvel diretamente pelos IDs
+    const [owner, tenant, property] = await Promise.all([
+      storage.getOwner(originalContract.ownerId),
+      storage.getTenant(originalContract.tenantId),
+      storage.getProperty(originalContract.propertyId)
+    ]);
+    
+    if (!originalContract || !newContract || !owner || !tenant || !property) {
+      return res.status(404).json({ error: 'Dados relacionados não encontrados' });
+    }
+    
+    // Criar um arquivo temporário para o PDF
+    const tempFilePath = path.join(tmpdir(), `termo_aditivo_${renewalId}_${Date.now()}.pdf`);
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: {
+        top: 50,
+        bottom: 50,
+        left: 50,
+        right: 50
+      },
+      info: {
+        Title: `Termo Aditivo de Renovação - ${owner.name} e ${tenant.name}`,
+        Author: 'Sistema de Gestão de Contratos de Aluguel',
+        Subject: 'Termo Aditivo de Renovação de Contrato',
+        Keywords: 'aluguel, contrato, renovação, termo aditivo',
+        CreationDate: new Date(),
+      }
+    }) as PDFDocumentWithMethods;
+    
+    // Criar um stream de escrita para o arquivo temporário
+    const writeStream = fs.createWriteStream(tempFilePath);
+    doc.pipe(writeStream);
+    
+    // Não precisamos do cabeçalho padrão, partes e informações do imóvel
+    // pois eles já estão no formato personalizado dentro do método addContractRenewalClauses
+    // addHeader(doc, 'TERMO ADITIVO DE RENOVAÇÃO DE CONTRATO DE LOCAÇÃO');
+    // addParties(doc, owner, tenant);
+    // addPropertyInfo(doc, property, newContract);
+    
+    // Adicionar cláusulas do termo aditivo
+    const renewalData: ContractRenewalData = {
+      renewal,
+      originalContract,
+      newContract,
+      owner,
+      tenant,
+      property
+    };
+    
+    addContractRenewalClauses(doc, renewalData);
+    
+    // Não adicionar assinaturas pois já estão nas cláusulas do termo
+    // addSignatureFields(doc, owner, tenant);
+    
+    // Finalizar o documento
+    doc.end();
+    
+    // Quando o stream for fechado, enviar o arquivo para o cliente
+    writeStream.on('finish', () => {
+      // Definir headers para download do PDF
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `inline; filename="termo_aditivo_${renewalId}.pdf"`);
+      
+      // Ler o arquivo e enviar para o cliente
+      const readStream = fs.createReadStream(tempFilePath);
+      readStream.pipe(res);
+      
+      // Remover o arquivo temporário após o envio
+      readStream.on('end', () => {
+        fs.unlink(tempFilePath, (err) => {
+          if (err) console.error('Erro ao remover arquivo temporário:', err);
+        });
+      });
+    });
+  } catch (error) {
+    console.error('Erro ao gerar PDF do termo aditivo:', error);
+    res.status(500).json({ error: 'Erro ao gerar PDF do termo aditivo' });
+  }
+}
+
+export async function generatePaymentReceiptPDF(req: Request, res: Response) {
+  try {
+    const paymentId = Number(req.params.id);
+    const payment = await storage.getPayment(paymentId);
+    
+    if (!payment) {
+      return res.status(404).json({ error: 'Pagamento não encontrado' });
+    }
+    
+    const contract = await storage.getContract(payment.contractId);
+    if (!contract) {
+      return res.status(404).json({ error: 'Contrato não encontrado' });
+    }
+    
+    const [owner, tenant, property] = await Promise.all([
+      storage.getOwner(contract.ownerId),
+      storage.getTenant(contract.tenantId),
+      storage.getProperty(contract.propertyId)
+    ]);
+    
+    if (!owner || !tenant || !property) {
+      return res.status(404).json({ error: 'Dados relacionados não encontrados' });
+    }
+    
+    // Formatar o endereço da propriedade
+    const propertyAddress = typeof property.address === 'string' 
+      ? JSON.parse(property.address) 
+      : property.address;
+    
+    const propertyAddressStr = `${propertyAddress.street}, ${propertyAddress.number}${propertyAddress.complement ? ', ' + propertyAddress.complement : ''}, ${propertyAddress.neighborhood}, ${propertyAddress.city} - ${propertyAddress.state}, CEP: ${propertyAddress.zipCode}`;
+    
+    // Formatar data de pagamento e mês de referência usando formatDateSafe
+    const paymentDate = payment.paymentDate 
+      ? formatDateSafe(payment.paymentDate) 
+      : 'Data não informada';
+    
+    // Usar a função formatDateSafe para a data de vencimento
+    const dueDate = new Date(payment.dueDate);
+    dueDate.setHours(15, 0, 0, 0); // Ajustado para GMT-3 (Horário de Brasília)
+    const paymentMonth = dueDate.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+    
+    // Criar um arquivo temporário para o PDF
+    const tempFilePath = path.join(tmpdir(), `recibo_pagamento_${paymentId}_${Date.now()}.pdf`);
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: {
+        top: 50,
+        bottom: 50,
+        left: 50,
+        right: 50
+      },
+      info: {
+        Title: `Recibo de Pagamento de Aluguel - ${paymentMonth}`,
+        Author: 'Sistema de Gestão de Contratos de Aluguel',
+        Subject: 'Recibo de Pagamento',
+        Keywords: 'aluguel, recibo, pagamento',
+        CreationDate: new Date(),
+      }
+    }) as PDFDocumentWithMethods;
+    
+    // Pipe o PDF para o arquivo temporário
+    const writeStream = fs.createWriteStream(tempFilePath);
+    doc.pipe(writeStream);
+    
+    // Adicionar cabeçalho
+    addHeader(doc, 'RECIBO DE PAGAMENTO DE ALUGUEL');
+    
+    // Adicionar informações do recibo
+    doc.moveDown(2);
+    doc.fontSize(12);
+    
+    doc.text(`Recibo Nº: ${paymentId}`, { align: 'left' });
+    doc.text(`Contrato Nº: ${contract.id}`, { align: 'left' });
+    doc.text(`Data de Pagamento: ${paymentDate}`, { align: 'left' });
+    doc.moveDown();
+    
+        // Todos os valores no sistema estão armazenados em reais
+    const paymentValueNum = Number(payment.value);
+    // Usamos o valor diretamente, sem conversão
+    const valueForDisplay = paymentValueNum;
+    // Converter para formato de moeda brasileira (R$ 1.150,00)
+    const paymentValue = valueForDisplay.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    doc.text(`Recebi de ${tenant.name} a importância de R$ ${paymentValue} (${valueToWords(valueForDisplay)}), referente ao aluguel do imóvel situado em ${propertyAddressStr}, relativo ao mês de ${paymentMonth}.`, { align: 'justify' });
+    
+    doc.moveDown(2);
+    doc.text(`Para maior clareza, firmo o presente recibo para que produza os seus jurídicos e legais efeitos.`, { align: 'justify' });
+    
+    doc.moveDown(4);
+    doc.text(`_________________________________________`, { align: 'center' });
+    doc.text(`${owner.name}`, { align: 'center' });
+    doc.text(`Proprietário`, { align: 'center' });
+    
+    // Finalizar o documento
+    doc.end();
+    
+    // Quando o stream terminar, envie o arquivo para o cliente
+    writeStream.on('finish', () => {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="recibo_pagamento_${paymentId}.pdf"`);
+      
+      const readStream = fs.createReadStream(tempFilePath);
+      readStream.pipe(res);
+      
+      // Limpar o arquivo temporário após o envio
+      readStream.on('end', () => {
+        fs.unlink(tempFilePath, (err) => {
+          if (err) console.error('Erro ao excluir arquivo temporário:', err);
+        });
+      });
+    });
+  } catch (error) {
+    console.error('Erro ao gerar PDF do recibo de pagamento:', error);
+    res.status(500).json({ error: 'Erro ao gerar PDF do recibo de pagamento' });
+  }
+}
+
+/**
+ * Gera carnês de pagamento para todas as parcelas de um contrato
+ * Formato: 2 recibos por página para economizar papel
+ */
+export async function generatePaymentSlipsPDF(req: Request, res: Response) {
+  try {
+    const contractId = Number(req.params.id);
+    const contract = await storage.getContract(contractId);
+    
+    if (!contract) {
+      return res.status(404).json({ error: 'Contrato não encontrado' });
+    }
+    
+    // Buscar dados relacionados
+    const [owner, tenant, property, payments] = await Promise.all([
+      storage.getOwner(contract.ownerId),
+      storage.getTenant(contract.tenantId),
+      storage.getProperty(contract.propertyId),
+      storage.getPaymentsByContract(contractId)
+    ]);
+    
+    if (!owner || !tenant || !property) {
+      return res.status(404).json({ error: 'Dados relacionados não encontrados' });
+    }
+    
+    // Filtrar apenas pagamentos não pagos
+    const pendingPayments = payments.filter(payment => !payment.isPaid);
+    
+    if (pendingPayments.length === 0) {
+      return res.status(404).json({ error: 'Não há parcelas pendentes para gerar carnês' });
+    }
+    
+    // Formatar o endereço da propriedade
+    const propertyAddress = typeof property.address === 'string' 
+      ? JSON.parse(property.address) 
+      : property.address;
+    
+    const propertyAddressStr = `${propertyAddress.street}, ${propertyAddress.number}${propertyAddress.complement ? ', ' + propertyAddress.complement : ''}, ${propertyAddress.neighborhood}, ${propertyAddress.city} - ${propertyAddress.state}, CEP: ${propertyAddress.zipCode}`;
+    
+    // Ordenar pagamentos por data de vencimento
+    pendingPayments.sort((a, b) => (() => { const dateA = new Date(a.dueDate); const dateB = new Date(b.dueDate); dateA.setHours(15, 0, 0, 0); dateB.setHours(15, 0, 0, 0); return dateA.getTime() - dateB.getTime(); })());
+    
+    // Criar um arquivo temporário para o PDF
+    const tempFilePath = path.join(tmpdir(), `carnes_pagamento_${contractId}_${Date.now()}.pdf`);
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: {
+        top: 50,
+        bottom: 50,
+        left: 50,
+        right: 50
+      },
+      info: {
+        Title: `Carnês de Pagamento - Contrato ${contractId}`,
+        Author: 'Sistema de Gestão de Aluguéis',
+        Subject: `Carnês para pagamento do aluguel - Contrato ${contractId}`
+      }
+    }) as PDFDocumentWithMethods;
+    
+    const writeStream = fs.createWriteStream(tempFilePath);
+    doc.pipe(writeStream);
+    
+    // Adicionar página de capa
+    doc.fontSize(18).font('Helvetica-Bold').text('CARNÊS DE PAGAMENTO', { align: 'center' });
+    doc.moveDown(0.5);
+    doc.fontSize(14).text(`Contrato Nº: ${contractId}`, { align: 'center' });
+    doc.moveDown(2);
+    
+    // Informações das partes
+    doc.fontSize(12).font('Helvetica-Bold').text('LOCADOR (PROPRIETÁRIO):');
+    doc.fontSize(10).font('Helvetica').text(`Nome: ${owner.name}`);
+    doc.text(`CPF: ${owner.document}`);
+    doc.moveDown(1);
+    
+    doc.fontSize(12).font('Helvetica-Bold').text('LOCATÁRIO (INQUILINO):');
+    doc.fontSize(10).font('Helvetica').text(`Nome: ${tenant.name}`);
+    doc.text(`CPF: ${tenant.document}`);
+    doc.moveDown(1);
+    
+    // Informações do imóvel
+    doc.fontSize(12).font('Helvetica-Bold').text('IMÓVEL:');
+    doc.fontSize(10).font('Helvetica').text(propertyAddressStr);
+    doc.moveDown(1);
+    
+    // Informações do contrato
+    doc.fontSize(12).font('Helvetica-Bold').text('INFORMAÇÕES DO CONTRATO:');
+    doc.fontSize(10).font('Helvetica').text(`Valor do Aluguel: R$ ${contract.rentValue.toFixed(2).replace('.', ',')}`);
+    doc.text(`Início: ${formatDateSafe(contract.startDate)}`);
+    doc.text(`Término: ${formatDateSafe(contract.endDate)}`);
+    doc.text(`Duração: ${contract.duration} meses`);
+    doc.moveDown(2);
+    
+    // Sumário das parcelas
+    doc.fontSize(12).font('Helvetica-Bold').text('PARCELAS INCLUÍDAS:');
+    doc.moveDown(0.5);
+    
+    const tableTop = doc.y;
+    const colWidth = (doc.page.width - doc.page.margins.left - doc.page.margins.right) / 3;
+    
+    doc.font('Helvetica-Bold');
+    doc.text('Nº', doc.page.margins.left, tableTop, { width: colWidth / 2 });
+    doc.text('Vencimento', doc.page.margins.left + colWidth / 2, tableTop, { width: colWidth });
+    doc.text('Valor (R$)', doc.page.margins.left + colWidth * 1.5, tableTop, { width: colWidth, align: 'right' });
+    
+    doc.moveTo(doc.page.margins.left, doc.y + 5)
+       .lineTo(doc.page.width - doc.page.margins.right, doc.y + 5)
+       .stroke();
+    doc.moveDown(0.5);
+    
+    // Listar parcelas
+    pendingPayments.forEach((payment, index) => {
+      const rowY = doc.y;
+      doc.font('Helvetica');
+      doc.text(`${index + 1}`, doc.page.margins.left, rowY, { width: colWidth / 2 });
+      doc.text(`${formatDateSafe(payment.dueDate)}`, doc.page.margins.left + colWidth / 2, rowY, { width: colWidth });
+      doc.text(`${payment.value.toFixed(2).replace('.', ',')}`, doc.page.margins.left + colWidth * 1.5, rowY, { width: colWidth, align: 'right' });
+      doc.moveDown(0.5);
+    });
+    
+    // Total
+    const totalValue = pendingPayments.reduce((sum, payment) => sum + payment.value, 0);
+    
+    doc.moveTo(doc.page.margins.left, doc.y)
+       .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+       .stroke();
+    doc.moveDown(0.5);
+    
+    doc.font('Helvetica-Bold');
+    doc.text('TOTAL:', doc.page.margins.left, doc.y, { width: colWidth * 1.5 });
+    doc.text(`${totalValue.toFixed(2).replace('.', ',')}`, doc.page.margins.left + colWidth * 1.5, doc.y, { width: colWidth, align: 'right' });
+    
+    doc.moveDown(2);
+    
+    // Instruções
+    doc.fontSize(10).font('Helvetica');
+    doc.text('Este documento contém os carnês para pagamento das parcelas do seu contrato de aluguel. Cada página seguinte contém 2 parcelas. Recorte nos locais indicados pelas linhas tracejadas e apresente o carnê no momento do pagamento.', { align: 'justify' });
+    
+    // Adicionar os carnês, 2 por página
+    for (let i = 0; i < pendingPayments.length; i += 2) {
+      // Adicionar nova página para cada par de carnês
+      doc.addPage();
+      
+      // Processar o primeiro carnê (sempre existe)
+      const payment1 = pendingPayments[i];
+      const dueDate1 = new Date(payment1.dueDate);
+        dueDate1.setHours(15, 0, 0, 0); // Ajustado para GMT-3 (Horário de Brasília)
+      const paymentMonth1 = dueDate1.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+      
+      // Parte superior da página (primeiro carnê)
+      const pageHeight = doc.page.height - doc.page.margins.top - doc.page.margins.bottom;
+      const halfPageHeight = pageHeight / 2;
+      
+      // Linha tracejada para recorte no topo da página
+      doc.fontSize(9).font('Helvetica');
+      doc.text('✂ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -', { align: 'center' });
+      doc.moveDown(0.3);
+      
+      // Cabeçalho do primeiro carnê
+      doc.fontSize(14).font('Helvetica-Bold').text('RECIBO DE PAGAMENTO - ALUGUEL', { align: 'center' });
+      doc.fontSize(11).font('Helvetica-Bold').text(`${paymentMonth1.toUpperCase()}`, { align: 'center' });
+      doc.fontSize(10).font('Helvetica-Bold').text(`Parcela ${i + 1} de ${pendingPayments.length} - Contrato Nº: ${contractId}`, { align: 'center' });
+      
+      // Grid com informações do primeiro carnê
+      const gridTop1 = doc.y + 5;
+      const gridHeight = 100;  // Altura reduzida para caber na metade da página
+      doc.rect(doc.page.margins.left, gridTop1, doc.page.width - doc.page.margins.left - doc.page.margins.right, gridHeight).stroke();
+      
+      // Linhas da grade
+      const lineY1_1 = gridTop1 + gridHeight/3;
+      const lineY2_1 = gridTop1 + (gridHeight*2/3);
+      doc.moveTo(doc.page.margins.left, lineY1_1).lineTo(doc.page.width - doc.page.margins.right, lineY1_1).stroke();
+      doc.moveTo(doc.page.margins.left, lineY2_1).lineTo(doc.page.width - doc.page.margins.right, lineY2_1).stroke();
+      
+      // Coluna central
+      const midX = doc.page.margins.left + (doc.page.width - doc.page.margins.left - doc.page.margins.right) / 2;
+      doc.moveTo(midX, gridTop1).lineTo(midX, gridTop1 + gridHeight).stroke();
+      
+      // Informações nas células
+      doc.fontSize(8).font('Helvetica-Bold');
+      
+      // Células do primeiro carnê
+      const cellPadding = 3;
+      
+      // Células superiores
+      doc.text('LOCADOR:', doc.page.margins.left + cellPadding, gridTop1 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+      doc.font('Helvetica').text(owner.name, doc.page.margins.left + cellPadding, gridTop1 + 12, { width: midX - doc.page.margins.left - 10 });
+      
+      doc.font('Helvetica-Bold').text('LOCATÁRIO:', midX + cellPadding, gridTop1 + cellPadding, { width: midX - doc.page.margins.right - 10 });
+      doc.font('Helvetica').text(tenant.name, midX + cellPadding, gridTop1 + 12, { width: midX - doc.page.margins.left - 10 });
+      
+      // Células do meio
+      doc.font('Helvetica-Bold').text('IMÓVEL:', doc.page.margins.left + cellPadding, lineY1_1 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+      const fullAddress = `${propertyAddress.street}, ${propertyAddress.number}${propertyAddress.complement ? ', ' + propertyAddress.complement : ''}, ${propertyAddress.neighborhood}, ${propertyAddress.city} - ${propertyAddress.state}`;
+      doc.fontSize(7).font('Helvetica').text(fullAddress, doc.page.margins.left + cellPadding, lineY1_1 + 12, { width: midX - doc.page.margins.left - 10 });
+      
+      doc.font('Helvetica-Bold').text('VENCIMENTO:', midX + cellPadding, lineY1_1 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+      doc.font('Helvetica').text(formatDateSafe(payment1.dueDate), midX + cellPadding, lineY1_1 + 12, { width: midX - doc.page.margins.left - 10 });
+      
+      // Células inferiores
+      doc.font('Helvetica-Bold').text('VALOR:', doc.page.margins.left + cellPadding, lineY2_1 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+      doc.font('Helvetica').text(`R$ ${payment1.value.toFixed(2).replace('.', ',')}`, doc.page.margins.left + cellPadding, lineY2_1 + 12, { width: midX - doc.page.margins.left - 10 });
+      
+      doc.font('Helvetica-Bold').text('FORMA DE PAGAMENTO:', midX + cellPadding, lineY2_1 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+      doc.font('Helvetica').text('__________________', midX + cellPadding, lineY2_1 + 12, { width: midX - doc.page.margins.left - 10 });
+      
+      // Área de assinatura
+      doc.y = gridTop1 + gridHeight + 10;
+      doc.fontSize(8).font('Helvetica');
+      doc.text('Data do Pagamento: ___/___/_____', { align: 'center' });
+      doc.moveDown(0.5);
+      doc.moveTo(doc.page.margins.left + 100, doc.y).lineTo(doc.page.width - doc.page.margins.right - 100, doc.y).stroke();
+      doc.text('Assinatura do recebedor', { align: 'center' });
+      
+      // Linha tracejada para separar os dois carnês da página
+      doc.moveDown(0.5);
+      doc.fontSize(9).font('Helvetica');
+      doc.text('✂ - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -', { align: 'center' });
+      
+      // Verificar se existe um segundo carnê para esta página
+      if (i + 1 < pendingPayments.length) {
+        const payment2 = pendingPayments[i + 1];
+        // Usar a função formatDateSafe para a data de vencimento para evitar problemas de fuso horário
+        const dueDate2 = new Date(payment2.dueDate);
+        dueDate2.setHours(15, 0, 0, 0); // Ajustado para GMT-3 (Horário de Brasília)
+        const paymentMonth2 = dueDate2.toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+        
+        // Parte inferior da página (segundo carnê)
+        doc.moveDown(0.3);
+        
+        // Cabeçalho do segundo carnê
+        doc.fontSize(14).font('Helvetica-Bold').text('RECIBO DE PAGAMENTO - ALUGUEL', { align: 'center' });
+        doc.fontSize(11).font('Helvetica-Bold').text(`${paymentMonth2.toUpperCase()}`, { align: 'center' });
+        doc.fontSize(10).font('Helvetica-Bold').text(`Parcela ${i + 2} de ${pendingPayments.length} - Contrato Nº: ${contractId}`, { align: 'center' });
+        
+        // Grid com informações do segundo carnê
+        const gridTop2 = doc.y + 5;
+        doc.rect(doc.page.margins.left, gridTop2, doc.page.width - doc.page.margins.left - doc.page.margins.right, gridHeight).stroke();
+        
+        // Linhas da grade
+        const lineY1_2 = gridTop2 + gridHeight/3;
+        const lineY2_2 = gridTop2 + (gridHeight*2/3);
+        doc.moveTo(doc.page.margins.left, lineY1_2).lineTo(doc.page.width - doc.page.margins.right, lineY1_2).stroke();
+        doc.moveTo(doc.page.margins.left, lineY2_2).lineTo(doc.page.width - doc.page.margins.right, lineY2_2).stroke();
+        
+        // Coluna central
+        doc.moveTo(midX, gridTop2).lineTo(midX, gridTop2 + gridHeight).stroke();
+        
+        // Informações nas células
+        doc.fontSize(8).font('Helvetica-Bold');
+        
+        // Células do segundo carnê
+        doc.text('LOCADOR:', doc.page.margins.left + cellPadding, gridTop2 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+        doc.font('Helvetica').text(owner.name, doc.page.margins.left + cellPadding, gridTop2 + 12, { width: midX - doc.page.margins.left - 10 });
+        
+        doc.font('Helvetica-Bold').text('LOCATÁRIO:', midX + cellPadding, gridTop2 + cellPadding, { width: midX - doc.page.margins.right - 10 });
+        doc.font('Helvetica').text(tenant.name, midX + cellPadding, gridTop2 + 12, { width: midX - doc.page.margins.left - 10 });
+        
+        // Células do meio
+        doc.font('Helvetica-Bold').text('IMÓVEL:', doc.page.margins.left + cellPadding, lineY1_2 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+        doc.fontSize(7).font('Helvetica').text(fullAddress, doc.page.margins.left + cellPadding, lineY1_2 + 12, { width: midX - doc.page.margins.left - 10 });
+        
+        doc.font('Helvetica-Bold').text('VENCIMENTO:', midX + cellPadding, lineY1_2 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+        doc.font('Helvetica').text(formatDateSafe(payment2.dueDate), midX + cellPadding, lineY1_2 + 12, { width: midX - doc.page.margins.left - 10 });
+        
+        // Células inferiores
+        doc.font('Helvetica-Bold').text('VALOR:', doc.page.margins.left + cellPadding, lineY2_2 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+        doc.font('Helvetica').text(`R$ ${payment2.value.toFixed(2).replace('.', ',')}`, doc.page.margins.left + cellPadding, lineY2_2 + 12, { width: midX - doc.page.margins.left - 10 });
+        
+        doc.font('Helvetica-Bold').text('FORMA DE PAGAMENTO:', midX + cellPadding, lineY2_2 + cellPadding, { width: midX - doc.page.margins.left - 10 });
+        doc.font('Helvetica').text('__________________', midX + cellPadding, lineY2_2 + 12, { width: midX - doc.page.margins.left - 10 });
+        
+        // Área de assinatura
+        doc.y = gridTop2 + gridHeight + 10;
+        doc.fontSize(8).font('Helvetica');
+        doc.text('Data do Pagamento: ___/___/_____', { align: 'center' });
+        doc.moveDown(0.5);
+        doc.moveTo(doc.page.margins.left + 100, doc.y).lineTo(doc.page.width - doc.page.margins.right - 100, doc.y).stroke();
+        doc.text('Assinatura do recebedor', { align: 'center' });
+      }
+    }
+    
+    // Finalizar o documento
+    doc.end();
+    
+    // Aguardar o término da gravação do arquivo
+    await new Promise<void>((resolve, reject) => {
+      writeStream.on('finish', () => {
+        resolve();
+      });
+      writeStream.on('error', (err) => {
+        reject(err);
+      });
+    });
+    
+    // Enviar o arquivo como resposta
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="carnes_contrato_${contractId}.pdf"`);
+    
+    // Ler o arquivo e enviá-lo
+    const fileStream = fs.createReadStream(tempFilePath);
+    fileStream.pipe(res);
+    
+    // Remover o arquivo temporário após o envio
+    fileStream.on('end', () => {
+      fs.unlink(tempFilePath, (err) => {
+        if (err) console.error('Erro ao excluir arquivo temporário:', err);
+      });
+    });
+    
+  } catch (error) {
+    console.error('Erro ao gerar carnês de pagamento:', error);
+    res.status(500).json({ error: 'Erro ao gerar carnês de pagamento' });
+  }
+}

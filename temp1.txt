@@ -1,0 +1,36 @@
+    if (!contract) {
+      return res.status(404).json({ error: 'Contrato não encontrado' });
+    }
+    
+    const [owner, tenant, property] = await Promise.all([
+      storage.getOwner(contract.ownerId),
+      storage.getTenant(contract.tenantId),
+      storage.getProperty(contract.propertyId)
+    ]);
+    
+    if (!owner || !tenant || !property) {
+      return res.status(404).json({ error: 'Dados relacionados não encontrados' });
+    }
+    
+    // Criar um arquivo temporário para o PDF
+    const tempFilePath = path.join(tmpdir(), `contrato_residencial_${contractId}_${Date.now()}.pdf`);
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: {
+        top: 50,
+        bottom: 50,
+        left: 50,
+        right: 50
+      },
+      info: {
+        Title: `Contrato de Locação Residencial - ${owner.name} e ${tenant.name}`,
+        Author: 'Sistema de Gestão de Contratos de Aluguel',
+        Subject: 'Contrato de Locação Residencial',
+        Keywords: 'aluguel, contrato, locação, residencial',
+        CreationDate: new Date(),
+      }
+    }) as PDFDocumentWithMethods;
+    
+    // Pipe o PDF para o arquivo temporário
+    const writeStream = fs.createWriteStream(tempFilePath);
+    doc.pipe(writeStream);

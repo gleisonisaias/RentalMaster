@@ -1,0 +1,33 @@
+        // Renderizar o conteúdo do modelo processado
+        doc.font('Helvetica').fontSize(10);
+        
+        // Substituir tags HTML por formatação do PDFKit
+        templateContent = templateContent
+          .replace(/<b>(.*?)<\/b>/g, "$1") // Remover tags de negrito (o PDFKit tratará o texto)
+          .replace(/<i>(.*?)<\/i>/g, "$1") // Remover tags de itálico
+          .replace(/<u>(.*?)<\/u>/g, "$1") // Remover tags de sublinhado
+          .replace(/<div[^>]*>(.*?)<\/div>/g, "$1"); // Remover divs
+        
+        // Dividir o conteúdo do modelo em parágrafos
+        const paragraphs = templateContent.split('\n\n');
+        
+        for (const paragraph of paragraphs) {
+          // Verificar se tem formatação de negrito
+          const boldMatch = paragraph.match(/<b>(.*?)<\/b>/);
+          if (boldMatch) {
+            doc.font('Helvetica-Bold').text(boldMatch[1]).font('Helvetica');
+          } else {
+            // Verificar se é um título com # 
+            const headerMatch = paragraph.match(/^(#{1,6})\s+(.*)$/);
+            if (headerMatch) {
+              const level = headerMatch[1].length;
+              const text = headerMatch[2];
+              
+              // Ajustar o tamanho da fonte com base no nível do cabeçalho
+              const fontSize = 16 - (level - 1) * 2;
+              doc.font('Helvetica-Bold').fontSize(fontSize).text(text).font('Helvetica').fontSize(10);
+            } else {
+              // Texto normal
+              doc.text(paragraph, { align: 'justify' });
+            }
+          }

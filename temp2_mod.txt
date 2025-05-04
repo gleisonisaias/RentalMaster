@@ -1,0 +1,5 @@
+        // Renderizar o conteúdo do modelo processado
+        doc.font("Helvetica").fontSize(10);
+        
+        // Usar a função de renderização de template HTML
+        renderHTMLTemplate(doc, templateContent);

@@ -1,0 +1,944 @@
+import { useState, useEffect, useRef } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { useMutation } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { ContractTemplate } from "@shared/schema";
+import { useToast } from "@/hooks/use-toast";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { 
+  Loader2, 
+  Save,
+  Maximize2,
+  ChevronDown,
+  ChevronUp,
+  FileText,
+  Copy,
+  Plus,
+  FileType,
+  Eye
+} from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+
+// Importar ReactQuill e os estilos
+import ReactQuill from 'react-quill';
+import 'react-quill/dist/quill.snow.css';
+
+// Schema de validação para o formulário
+const templateFormSchema = z.object({
+  name: z.string().min(3, "O nome deve ter pelo menos 3 caracteres"),
+  type: z.enum(["residential", "commercial"], {
+    required_error: "Selecione o tipo de contrato",
+  }),
+  content: z.string().min(50, "O conteúdo deve ter pelo menos 50 caracteres"),
+  isActive: z.boolean().default(true),
+});
+
+type TemplateFormValues = z.infer<typeof templateFormSchema>;
+
+interface ContractTemplateEditorProps {
+  initialData?: ContractTemplate;
+  templateId?: number;
+  onSuccess?: () => void;
+}
+
+export function ContractTemplateEditor({
+  initialData,
+  templateId,
+  onSuccess,
+}: ContractTemplateEditorProps) {
+  const { toast } = useToast();
+  
+  // Estados para controlar o colapso de cada seção - inicialmente todas fechadas
+  const [ownerSectionOpen, setOwnerSectionOpen] = useState(false);
+  const [propertySectionOpen, setPropertySectionOpen] = useState(false);
+  const [tenantSectionOpen, setTenantSectionOpen] = useState(false);
+  const [guarantorSectionOpen, setGuarantorSectionOpen] = useState(false);
+  const [contractSectionOpen, setContractSectionOpen] = useState(false);
+  const [fullscreenEditorOpen, setFullscreenEditorOpen] = useState(false);
+  const [allSectionsOpen, setAllSectionsOpen] = useState(false);
+  
+  // Estado para controlar a visualização em modo A4
+  const [a4Mode, setA4Mode] = useState(false);
+  // Estado para controlar a exibição de quebras de página
+  const [showPageBreaks, setShowPageBreaks] = useState(true);
+  
+  // Função para mostrar/ocultar todas as seções
+  const toggleAllSections = (e: React.MouseEvent) => {
+    e.preventDefault(); // Prevenir o comportamento padrão
+    e.stopPropagation(); // Impedir que o evento se propague
+    const newState = !allSectionsOpen;
+    setAllSectionsOpen(newState);
+    setOwnerSectionOpen(newState);
+    setPropertySectionOpen(newState);
+    setTenantSectionOpen(newState);
+    setGuarantorSectionOpen(newState);
+    setContractSectionOpen(newState);
+  };
+
+  // Inicializar o formulário com os dados do modelo, se fornecidos
+  const form = useForm<TemplateFormValues>({
+    resolver: zodResolver(templateFormSchema),
+    defaultValues: initialData
+      ? {
+          name: initialData.name,
+          type: initialData.type as "residential" | "commercial",
+          content: initialData.content,
+          isActive: initialData.isActive === null ? true : !!initialData.isActive,
+        }
+      : {
+          name: "",
+          type: "residential",
+          content: "",
+          isActive: true,
+        },
+  });
+
+  // Mutação para criar ou atualizar um modelo
+  const saveMutation = useMutation({
+    mutationFn: async (data: TemplateFormValues) => {
+      if (templateId) {
+        // Atualizar modelo existente
+        await apiRequest("PATCH", `/api/contract-templates/${templateId}`, data);
+      } else {
+        // Criar novo modelo
+        await apiRequest("POST", "/api/contract-templates", data);
+      }
+    },
+    onSuccess: () => {
+      toast({
+        title: templateId ? "Modelo atualizado" : "Modelo criado",
+        description: templateId
+          ? "O modelo foi atualizado com sucesso."
+          : "O modelo foi criado com sucesso.",
+      });
+      queryClient.invalidateQueries({ queryKey: ["/api/contract-templates"] });
+      
+      if (onSuccess) {
+        onSuccess();
+      }
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Erro ao salvar modelo",
+        description: error.message || "Ocorreu um erro ao salvar o modelo.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  // Função para lidar com o envio do formulário
+  const onSubmit = (values: TemplateFormValues) => {
+    // Verificar se o conteúdo é muito grande e fazer um log para debug
+    console.log(`Tamanho do conteúdo: ${values.content.length} caracteres`);
+    
+    // Garantir que o conteúdo não seja muito grande
+    if (values.content.length > 9000000) {
+      toast({
+        title: "Conteúdo muito grande",
+        description: "O conteúdo do modelo é muito grande. Por favor, reduza-o.",
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    // Enviar para o servidor
+    saveMutation.mutate(values);
+  };
+
+  // Variáveis para o conteúdo de exemplo
+  const placeholders = {
+    residential: 
+`<div style="text-align: center; font-size: 18px; font-weight: bold;">
+CONTRATO DE LOCAÇÃO RESIDENCIAL
+</div>
+
+<b>LOCADOR:</b> {{owner.name}}, {{owner.nationality}}, {{owner.maritalStatus}}, portador(a) do CPF nº {{owner.document}}, residente e domiciliado(a) em {{owner.address}}.
+
+<b>LOCATÁRIO:</b> {{tenant.name}}, {{tenant.nationality}}, {{tenant.maritalStatus}}, portador(a) do CPF nº {{tenant.document}}, residente e domiciliado(a) em {{tenant.address}}.
+
+<b>IMÓVEL:</b> {{property.address}}, com área de {{property.area}}m².
+
+<div style="font-weight: bold;">CLÁUSULA PRIMEIRA - PRAZO</div>
+O prazo da locação é de {{contract.duration}} meses, iniciando-se em {{contract.startDate}} e terminando em {{contract.endDate}}, data em que o LOCATÁRIO se obriga a restituir o imóvel desocupado.
+
+<div style="font-weight: bold;">CLÁUSULA SEGUNDA - VALOR DO ALUGUEL</div>
+O valor do aluguel mensal é de R$ {{contract.rentValue}}, a ser pago até o dia {{contract.paymentDay}} de cada mês.
+
+<div style="font-weight: bold;">CLÁUSULA TERCEIRA - OBRIGAÇÕES DO LOCATÁRIO</div>
+...
+
+<div style="text-align: center; margin-top: 30px;">
+(Local e data)
+
+<div style="margin-top: 50px; display: flex; justify-content: space-around;">
+<div>_______________________________</div>
+<div>_______________________________</div>
+</div>
+
+<div style="display: flex; justify-content: space-around;">
+<div>LOCADOR</div>
+<div>LOCATÁRIO</div>
+</div>
+</div>
+`,
+    commercial: 
+`<div style="text-align: center; font-size: 18px; font-weight: bold;">
+CONTRATO DE LOCAÇÃO COMERCIAL
+</div>
+
+<b>LOCADOR:</b> {{owner.name}}, inscrito(a) no CPF sob o nº {{owner.document}}, com endereço em {{owner.address}}.
+
+<b>LOCATÁRIO:</b> {{tenant.name}}, inscrito(a) no CPF/CNPJ sob o nº {{tenant.document}}, com endereço em {{tenant.address}}.
+
+<b>IMÓVEL COMERCIAL:</b> {{property.address}}, com área de {{property.area}}m².
+
+<div style="font-weight: bold;">CLÁUSULA PRIMEIRA - OBJETO E FINALIDADE</div>
+O LOCADOR cede ao LOCATÁRIO o imóvel acima descrito, para fins exclusivamente comerciais, para a atividade de: _______________.
+
+<div style="font-weight: bold;">CLÁUSULA SEGUNDA - PRAZO</div>
+A presente locação terá o prazo de {{contract.duration}} meses, com início em {{contract.startDate}} e término em {{contract.endDate}}.
+
+<div style="font-weight: bold;">CLÁUSULA TERCEIRA - VALOR E FORMA DE PAGAMENTO</div>
+O valor do aluguel mensal é de R$ {{contract.rentValue}}, a ser pago até o dia {{contract.paymentDay}} de cada mês.
+
+<div style="font-weight: bold;">CLÁUSULA QUARTA - REAJUSTE</div>
+...
+
+<div style="text-align: center; margin-top: 30px;">
+(Local e data)
+
+<div style="margin-top: 50px; display: flex; justify-content: space-around;">
+<div>_______________________________</div>
+<div>_______________________________</div>
+</div>
+
+<div style="display: flex; justify-content: space-around;">
+<div>LOCADOR</div>
+<div>LOCATÁRIO</div>
+</div>
+</div>
+`,
+  };
+
+  // Função para inserir placeholders no editor
+  const insertPlaceholder = (placeholder: string, event?: React.MouseEvent) => {
+    // Evitar propagação e comportamento padrão para não fechar o popup
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    
+    const currentContent = form.getValues("content");
+    const newContent = currentContent + placeholder;
+    form.setValue("content", newContent, { shouldValidate: true });
+    
+    // Atualizar o editor Quill (isso acontecerá automaticamente devido ao estado do React)
+  };
+  
+  // Função para copiar placeholder para área de transferência
+  const copyPlaceholder = (placeholder: string, event: React.MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    navigator.clipboard.writeText(placeholder)
+      .then(() => {
+        toast({
+          title: "Copiado!",
+          description: `"${placeholder}" copiado para a área de transferência.`,
+          duration: 2000,
+        });
+      })
+      .catch(err => {
+        console.error('Erro ao copiar: ', err);
+      });
+  };
+
+  // Função para carregar conteúdo de exemplo para o tipo de contrato selecionado
+  const loadExampleContent = (e?: React.MouseEvent) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    const currentType = form.getValues("type");
+    form.setValue("content", placeholders[currentType], { shouldValidate: true });
+  };
+
+  // Cores personalizadas para melhor suporte no PDF
+  const customColors = [
+    '#000000', '#434343', '#666666', '#999999', '#b7b7b7', '#cccccc', '#d9d9d9', '#efefef', '#f3f3f3', '#ffffff',
+    '#980000', '#ff0000', '#ff9900', '#ffff00', '#00ff00', '#00ffff', '#4a86e8', '#0000ff', '#9900ff', '#ff00ff',
+    '#e6b8af', '#f4cccc', '#fce5cd', '#fff2cc', '#d9ead3', '#d0e0e3', '#c9daf8', '#cfe2f3', '#d9d2e9', '#ead1dc',
+    '#dd7e6b', '#ea9999', '#f9cb9c', '#ffe599', '#b6d7a8', '#a2c4c9', '#a4c2f4', '#9fc5e8', '#b4a7d6', '#d5a6bd',
+    '#cc4125', '#e06666', '#f6b26b', '#ffd966', '#93c47d', '#76a5af', '#6d9eeb', '#6fa8dc', '#8e7cc3', '#c27ba0',
+    '#a61c00', '#cc0000', '#e69138', '#f1c232', '#6aa84f', '#45818e', '#3c78d8', '#3d85c6', '#674ea7', '#a64d79',
+    '#85200c', '#990000', '#b45f06', '#bf9000', '#38761d', '#134f5c', '#1155cc', '#0b5394', '#351c75', '#741b47',
+    '#5b0f00', '#660000', '#783f04', '#7f6000', '#274e13', '#0c343d', '#1c4587', '#073763', '#20124d', '#4c1130'
+  ];
+
+  // Configurações do Quill Editor com cores personalizadas
+  const quillModules = {
+    toolbar: [
+      [{ 'header': [1, 2, 3, 4, 5, 6, false] }],
+      ['bold', 'italic', 'underline', 'strike'],
+      [{ 'list': 'ordered' }, { 'list': 'bullet' }],
+      [{ 'script': 'sub' }, { 'script': 'super' }],
+      [{ 'indent': '-1' }, { 'indent': '+1' }],
+      [{ 'size': ['small', false, 'large', 'huge', '18', '24', '36', '48', '72', '96'] }],
+      [{ 'align': ['', 'center', 'right', 'justify'] }],
+      [{ 'color': customColors }, { 'background': customColors }],
+      ['blockquote', 'code-block'],
+      ['clean']
+    ],
+  };
+
+  // Função para renderizar quebras de página
+  const renderPageBreaks = (editorRef: HTMLDivElement | null) => {
+    if (!editorRef || !showPageBreaks) return;
+    
+    // Remover quebras de página existentes
+    const existingBreaks = editorRef.querySelectorAll('.page-break');
+    existingBreaks.forEach(el => el.remove());
+    
+    // Obter altura total do conteúdo
+    const contentHeight = editorRef.scrollHeight;
+    // Altura de uma página A4 em pixels (aproximadamente 29.7cm)
+    // Para um cálculo mais preciso, considere a DPI da tela
+    const a4HeightPx = 1122; // Altura aproximada de uma página A4 em pixels (29.7cm)
+    
+    // Calcular número de páginas
+    const numPages = Math.ceil(contentHeight / a4HeightPx);
+    
+    // Inserir marcadores de quebra de página
+    for (let i = 1; i < numPages; i++) {
+      const breakPosition = i * a4HeightPx;
+      
+      // Encontrar o elemento em ou após a posição da quebra
+      let elementAtBreak: Element | null = null;
+      let minDistance = Infinity;
+      
+      // Atravessar todos os elementos no editor
+      const allElements = Array.from(editorRef.querySelectorAll('*'));
+      
+      for (const el of allElements) {
+        // Usamos getBoundingClientRect para obter a posição, que é mais seguro em termos de tipagem
+        const rect = el.getBoundingClientRect();
+        const editorRect = editorRef.getBoundingClientRect();
+        
+        // Calculamos a posição relativa ao editor
+        const relativeTop = rect.top - editorRect.top + editorRef.scrollTop;
+        
+        // Encontrar o elemento mais próximo da quebra de página
+        if (relativeTop >= breakPosition && relativeTop - breakPosition < minDistance) {
+          minDistance = relativeTop - breakPosition;
+          elementAtBreak = el;
+        }
+      }
+      
+      // Verificamos se o elemento e seu nó pai existem
+      // Usamos type casting para HTMLElement para garantir que o parentNode seja acessível
+      if (elementAtBreak) {
+        const htmlElement = elementAtBreak as HTMLElement;
+        const parentNode = htmlElement.parentNode;
+        
+        if (parentNode) {
+          // Criar marcador de quebra de página
+          const pageBreak = document.createElement('div');
+          pageBreak.className = 'page-break';
+          
+          // Inserir antes do elemento
+          parentNode.insertBefore(pageBreak, elementAtBreak);
+        }
+      }
+    }
+  };
+  
+  // Função para alternar modo de visualização A4
+  const toggleA4Mode = () => {
+    setA4Mode(!a4Mode);
+  };
+  
+  // Função para alternar visualização de quebras de página
+  const togglePageBreaks = () => {
+    setShowPageBreaks(!showPageBreaks);
+  };
+  
+  // Ref para o editor
+  const editorRef = useRef<HTMLDivElement | null>(null);
+  
+  // Efeito para renderizar quebras de página quando o conteúdo muda
+  useEffect(() => {
+    // Timeout para dar tempo ao conteúdo se renderizar
+    const timeout = setTimeout(() => {
+      if (editorRef.current) {
+        renderPageBreaks(editorRef.current);
+      }
+    }, 500);
+    
+    return () => clearTimeout(timeout);
+  }, [form.watch("content"), showPageBreaks, a4Mode]);
+  
+  // Atualizar o conteúdo quando o tipo de contrato mudar
+  useEffect(() => {
+    const subscription = form.watch((value, { name }) => {
+      if (name === "type" && !form.getValues("content")) {
+        const currentType = form.getValues("type");
+        form.setValue("content", placeholders[currentType], { shouldValidate: true });
+      }
+    });
+    
+    return () => subscription.unsubscribe();
+  }, [form, placeholders]);
+
+  return (
+    <TooltipProvider>
+      <Form {...form}>
+        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem className="md:col-span-2">
+                <FormLabel>Nome do Modelo</FormLabel>
+                <FormControl>
+                  <Input placeholder="Nome do modelo de contrato" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="type"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Tipo de Contrato</FormLabel>
+                <Select
+                  onValueChange={field.onChange}
+                  defaultValue={field.value}
+                >
+                  <FormControl>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Selecione o tipo" />
+                    </SelectTrigger>
+                  </FormControl>
+                  <SelectContent>
+                    <SelectItem value="residential">Residencial</SelectItem>
+                    <SelectItem value="commercial">Comercial</SelectItem>
+                  </SelectContent>
+                </Select>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
+
+        {/* Botões para carregar conteúdo de exemplo e exibir todas as variáveis */}
+        <div className="flex justify-between mb-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={loadExampleContent}
+            className="text-sm"
+          >
+            <FileText className="w-4 h-4 mr-1" />
+            Carregar Modelo {form.getValues("type") === "residential" ? "Residencial" : "Comercial"}
+          </Button>
+          
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={toggleAllSections}
+            className="text-sm"
+          >
+            {allSectionsOpen ? (
+              <>
+                <ChevronUp className="w-4 h-4 mr-1" />
+                Ocultar Variáveis
+              </>
+            ) : (
+              <>
+                <ChevronDown className="w-4 h-4 mr-1" />
+                Mostrar Variáveis
+              </>
+            )}
+          </Button>
+        </div>
+
+        {/* Seções de variáveis do proprietário */}
+        <Card className="mb-4">
+          <CardHeader className="py-3 cursor-pointer" onClick={() => setOwnerSectionOpen(!ownerSectionOpen)}>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-md">
+                Dados do Proprietário
+              </CardTitle>
+              {ownerSectionOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </div>
+          </CardHeader>
+          {ownerSectionOpen && (
+            <CardContent className="py-2 grid grid-cols-2 md:grid-cols-3 gap-2">
+              {[
+                { label: "Nome", value: "{{owner.name}}" },
+                { label: "Documento (CPF)", value: "{{owner.document}}" },
+                { label: "Nacionalidade", value: "{{owner.nationality}}" },
+                { label: "Estado civil", value: "{{owner.maritalStatus}}" },
+                { label: "Nome do cônjuge", value: "{{owner.spouseName}}" },
+                { label: "Endereço", value: "{{owner.address}}" },
+                { label: "Telefone", value: "{{owner.phone}}" },
+                { label: "E-mail", value: "{{owner.email}}" },
+              ].map((item) => (
+                <div key={item.value} className="flex space-x-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="text-xs w-full justify-between"
+                    onClick={(e) => insertPlaceholder(item.value, e)}
+                  >
+                    <span>{item.label}</span>
+                    <Plus className="w-3 h-3" />
+                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="px-2"
+                        onClick={(e) => copyPlaceholder(item.value, e)}
+                      >
+                        <Copy className="w-3 h-3" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Copiar</TooltipContent>
+                  </Tooltip>
+                </div>
+              ))}
+            </CardContent>
+          )}
+        </Card>
+
+        {/* Seções de variáveis da propriedade */}
+        <Card className="mb-4">
+          <CardHeader className="py-3 cursor-pointer" onClick={() => setPropertySectionOpen(!propertySectionOpen)}>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-md">
+                Dados do Imóvel
+              </CardTitle>
+              {propertySectionOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </div>
+          </CardHeader>
+          {propertySectionOpen && (
+            <CardContent className="py-2 grid grid-cols-2 md:grid-cols-3 gap-2">
+              {[
+                { label: "Nome/Identificação", value: "{{property.name}}" },
+                { label: "Endereço", value: "{{property.address}}" },
+                { label: "Tipo", value: "{{property.type}}" },
+                { label: "Área (m²)", value: "{{property.area}}" },
+                { label: "Descrição", value: "{{property.description}}" },
+                { label: "Quartos", value: "{{property.bedrooms}}" },
+                { label: "Banheiros", value: "{{property.bathrooms}}" },
+                { label: "Empresa de água", value: "{{property.waterCompany}}" },
+                { label: "Núm. conta de água", value: "{{property.waterAccountNumber}}" },
+                { label: "Empresa de energia", value: "{{property.electricityCompany}}" },
+                { label: "Núm. conta de energia", value: "{{property.electricityAccountNumber}}" },
+              ].map((item) => (
+                <div key={item.value} className="flex space-x-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="text-xs w-full justify-between"
+                    onClick={(e) => insertPlaceholder(item.value, e)}
+                  >
+                    <span>{item.label}</span>
+                    <Plus className="w-3 h-3" />
+                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="px-2"
+                        onClick={(e) => copyPlaceholder(item.value, e)}
+                      >
+                        <Copy className="w-3 h-3" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Copiar</TooltipContent>
+                  </Tooltip>
+                </div>
+              ))}
+            </CardContent>
+          )}
+        </Card>
+
+        {/* Seções de variáveis do locatário */}
+        <Card className="mb-4">
+          <CardHeader className="py-3 cursor-pointer" onClick={() => setTenantSectionOpen(!tenantSectionOpen)}>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-md">
+                Dados do Inquilino
+              </CardTitle>
+              {tenantSectionOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </div>
+          </CardHeader>
+          {tenantSectionOpen && (
+            <CardContent className="py-2 grid grid-cols-2 md:grid-cols-3 gap-2">
+              {[
+                { label: "Nome", value: "{{tenant.name}}" },
+                { label: "Documento (CPF/CNPJ)", value: "{{tenant.document}}" },
+                { label: "Nacionalidade", value: "{{tenant.nationality}}" },
+                { label: "Estado civil", value: "{{tenant.maritalStatus}}" },
+                { label: "Nome do cônjuge", value: "{{tenant.spouseName}}" },
+                { label: "Profissão", value: "{{tenant.profession}}" },
+                { label: "Endereço", value: "{{tenant.address}}" },
+                { label: "Telefone", value: "{{tenant.phone}}" },
+                { label: "E-mail", value: "{{tenant.email}}" },
+              ].map((item) => (
+                <div key={item.value} className="flex space-x-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="text-xs w-full justify-between"
+                    onClick={(e) => insertPlaceholder(item.value, e)}
+                  >
+                    <span>{item.label}</span>
+                    <Plus className="w-3 h-3" />
+                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="px-2"
+                        onClick={(e) => copyPlaceholder(item.value, e)}
+                      >
+                        <Copy className="w-3 h-3" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Copiar</TooltipContent>
+                  </Tooltip>
+                </div>
+              ))}
+            </CardContent>
+          )}
+        </Card>
+
+        {/* Seções de variáveis do fiador */}
+        <Card className="mb-4">
+          <CardHeader className="py-3 cursor-pointer" onClick={() => setGuarantorSectionOpen(!guarantorSectionOpen)}>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-md">
+                Dados do Fiador
+              </CardTitle>
+              {guarantorSectionOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </div>
+          </CardHeader>
+          {guarantorSectionOpen && (
+            <CardContent className="py-2 grid grid-cols-2 md:grid-cols-3 gap-2">
+              {[
+                { label: "Nome", value: "{{guarantor.name}}" },
+                { label: "Documento (CPF)", value: "{{guarantor.document}}" },
+                { label: "Nacionalidade", value: "{{guarantor.nationality}}" },
+                { label: "Estado civil", value: "{{guarantor.maritalStatus}}" },
+                { label: "Profissão", value: "{{guarantor.profession}}" },
+                { label: "Endereço", value: "{{guarantor.address}}" },
+                { label: "Telefone", value: "{{guarantor.phone}}" },
+                { label: "E-mail", value: "{{guarantor.email}}" },
+                { label: "RG", value: "{{guarantor.rg}}" },
+                { label: "Nome do Cônjuge", value: "{{guarantor.spouseName}}" },
+              ].map((item) => (
+                <div key={item.value} className="flex space-x-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="text-xs w-full justify-between"
+                    onClick={(e) => insertPlaceholder(item.value, e)}
+                  >
+                    <span>{item.label}</span>
+                    <Plus className="w-3 h-3" />
+                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="px-2"
+                        onClick={(e) => copyPlaceholder(item.value, e)}
+                      >
+                        <Copy className="w-3 h-3" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Copiar</TooltipContent>
+                  </Tooltip>
+                </div>
+              ))}
+            </CardContent>
+          )}
+        </Card>
+
+        {/* Seções de variáveis do contrato */}
+        <Card className="mb-4">
+          <CardHeader className="py-3 cursor-pointer" onClick={() => setContractSectionOpen(!contractSectionOpen)}>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-md">
+                Dados do Contrato
+              </CardTitle>
+              {contractSectionOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </div>
+          </CardHeader>
+          {contractSectionOpen && (
+            <CardContent className="py-2 grid grid-cols-2 md:grid-cols-3 gap-2">
+              {[
+                { label: "Tipo", value: "{{contract.type}}" },
+                { label: "Número", value: "{{contract.id}}" },
+                { label: "Data de início", value: "{{contract.startDate}}" },
+                { label: "Data de término", value: "{{contract.endDate}}" },
+                { label: "Duração (meses)", value: "{{contract.duration}}" },
+                { label: "Valor do aluguel", value: "{{contract.rentValue}}" },
+                { label: "Valor por extenso", value: "{{contract.rentValueInWords}}" },
+                { label: "Dia de pagamento", value: "{{contract.paymentDay}}" },
+                { label: "Data atual", value: "{{DATA_ATUAL}}" },
+                { label: "Data curta", value: "{{DATA_CURTA}}" },
+                { label: "Data completa", value: "{{DATA_LONGA}}" },
+                { label: "Hora atual", value: "{{HORA}}" },
+                { label: "Número da página", value: "{{PAGINA}}" },
+              ].map((item) => (
+                <div key={item.value} className="flex space-x-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="text-xs w-full justify-between"
+                    onClick={(e) => insertPlaceholder(item.value, e)}
+                  >
+                    <span>{item.label}</span>
+                    <Plus className="w-3 h-3" />
+                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="px-2"
+                        onClick={(e) => copyPlaceholder(item.value, e)}
+                      >
+                        <Copy className="w-3 h-3" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Copiar</TooltipContent>
+                  </Tooltip>
+                </div>
+              ))}
+            </CardContent>
+          )}
+        </Card>
+
+        <FormField
+          control={form.control}
+          name="content"
+          render={({ field }) => (
+            <FormItem>
+              <div className="flex items-center justify-between">
+                <FormLabel>Conteúdo do Modelo</FormLabel>
+                <div className="flex gap-2">
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button 
+                          variant={a4Mode ? "default" : "ghost"} 
+                          size="sm"
+                          onClick={toggleA4Mode}
+                        >
+                          <FileType className="w-4 h-4 mr-1" />
+                          {a4Mode ? "Modo Normal" : "Modo A4"}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {a4Mode ? "Voltar ao modo de edição normal" : "Visualizar em formato A4"}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                  
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button 
+                          variant={showPageBreaks ? "default" : "ghost"} 
+                          size="sm"
+                          onClick={togglePageBreaks}
+                          disabled={!a4Mode}
+                        >
+                          <Eye className="w-4 h-4 mr-1" />
+                          {showPageBreaks ? "Ocultar Quebras" : "Mostrar Quebras"}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {showPageBreaks ? "Ocultar quebras de página" : "Mostrar quebras de página"}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                  
+                  <Dialog open={fullscreenEditorOpen} onOpenChange={setFullscreenEditorOpen}>
+                    <DialogTrigger asChild>
+                      <Button variant="ghost" size="sm">
+                        <Maximize2 className="w-4 h-4 mr-1" />
+                        Tela Cheia
+                      </Button>
+                    </DialogTrigger>
+                    <DialogContent className="max-w-5xl w-full h-[90vh] flex flex-col">
+                      <DialogHeader>
+                        <DialogTitle>Editor de Modelo - Tela Cheia</DialogTitle>
+                        <DialogDescription>
+                          Edite o conteúdo do modelo com mais espaço.
+                        </DialogDescription>
+                      </DialogHeader>
+                      <div className="flex items-center gap-2 mb-2">
+                        <Button 
+                          variant={a4Mode ? "default" : "outline"} 
+                          size="sm"
+                          onClick={toggleA4Mode}
+                        >
+                          <FileType className="w-4 h-4 mr-1" />
+                          {a4Mode ? "Modo Normal" : "Modo A4"}
+                        </Button>
+                        
+                        <Button 
+                          variant={showPageBreaks ? "default" : "outline"} 
+                          size="sm"
+                          onClick={togglePageBreaks}
+                          disabled={!a4Mode}
+                        >
+                          <Eye className="w-4 h-4 mr-1" />
+                          {showPageBreaks ? "Ocultar Quebras" : "Mostrar Quebras"}
+                        </Button>
+                      </div>
+                      <div className={`flex-grow overflow-y-auto ${a4Mode ? 'a4-fullscreen' : ''}`}>
+                        <ReactQuill 
+                          value={field.value}
+                          onChange={(content) => {
+                            field.onChange(content);
+                            // Sincronizar com o editor principal
+                            form.setValue("content", content, { shouldValidate: true });
+                          }}
+                          modules={quillModules}
+                          className="h-[calc(100vh-250px)]"
+                          theme="snow"
+                        />
+                      </div>
+                      <DialogFooter>
+                        <Button onClick={() => setFullscreenEditorOpen(false)}>
+                          Fechar
+                        </Button>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
+                </div>
+              </div>
+              <FormControl>
+                <div className={`border rounded-md mb-20 ${a4Mode ? 'a4-mode' : ''}`} style={{ marginBottom: "50px" }}>
+                  <ReactQuill 
+                    value={field.value}
+                    onChange={field.onChange}
+                    modules={quillModules}
+                    className="h-[350px]"
+                    theme="snow"
+                    style={{ 
+                      marginBottom: "30px",
+                      paddingBottom: "20px"
+                    }}
+                    ref={(el) => {
+                      // Captura o elemento DOM do editor quando disponível
+                      if (el) {
+                        // @ts-ignore - acessando o elemento DOM interno do Quill
+                        editorRef.current = el.getEditor().root;
+                      }
+                    }}
+                  />
+                </div>
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <div className="flex justify-end mt-8 pt-4 z-20 relative" style={{ marginBottom: "60px" }}>
+          <Button 
+            type="submit" 
+            disabled={saveMutation.isPending} 
+            className="py-2 px-4 shadow-md hover:shadow-lg transition-all"
+            style={{ 
+              position: "relative", 
+              zIndex: 50,
+              backgroundColor: "#4a86e8",
+              color: "white",
+              fontWeight: "bold"
+            }}
+          >
+            {saveMutation.isPending ? (
+              <>
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                Salvando...
+              </>
+            ) : (
+              <>
+                <Save className="w-4 h-4 mr-2" />
+                Salvar Modelo
+              </>
+            )}
+          </Button>
+        </div>
+        </form>
+      </Form>
+    </TooltipProvider>
+  );
+}

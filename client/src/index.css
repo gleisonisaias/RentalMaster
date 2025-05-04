@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+  }
+}
+
+/* Melhorias para o editor ReactQuill */
+.ql-editor {
+  min-height: 300px;
+  padding-bottom: 50px !important;
+}
+
+/* Adiciona mais espaço abaixo do editor para o botão de salvar */
+.ql-container {
+  margin-bottom: 40px !important;
+}
+
+/* Melhorias para cores no ReactQuill */
+.ql-color .ql-picker-options [data-value="#ff0000"], .ql-color-red {
+  color: #ff0000 !important;
+}
+
+.ql-color .ql-picker-options [data-value="#0000ff"], .ql-color-blue {
+  color: #0000ff !important;
+}
+
+.ql-color .ql-picker-options [data-value="#00ff00"], .ql-color-green {
+  color: #00ff00 !important;
+}
+
+/* Melhorias para o botão de salvar */
+form .z-20 button {
+  position: relative;
+  z-index: 50; 
+}
+
+/* Espaço adicional abaixo do formulário */
+form {
+  padding-bottom: 60px;
+}
